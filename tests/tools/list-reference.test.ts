@@ -1,6 +1,6 @@
 /** @fileoverview Reference vocabularies through runtime contracts with real source parsing. @module tests/tools/list-reference */
 import { z } from '@cyanheads/mcp-ts-core';
-import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SOURCE_CACHE_TTL_MS } from '../../src/domain/contracts.js';
 import { listReference } from '../../src/mcp-server/tools/definitions/list-reference.tool.js';
@@ -10,11 +10,13 @@ import { principal, snapshotResponse } from '../services/fara/fixtures.js';
 
 let calls: URL[];
 let body: unknown;
+let state: ReturnType<typeof createMockContext>['state'];
 beforeEach(() => {
   vi.useFakeTimers();
   // Expire module-owned public vocabulary cache between tests without resetting source modules.
   vi.setSystemTime(new Date(2030, 0, 1 + 3 * testDay++));
   calls = [];
+  state = createMockContext().state;
   body = [
     { value: 'TEC', name: 'Telecommunications' },
     { value: 'SCI', name: 'Science Technology' },
@@ -34,9 +36,12 @@ afterEach(() => {
   getLdaService().dispose();
   vi.useRealTimers();
 });
-async function invoke(input: Record<string, unknown>) {
-  const definition: Parameters<typeof runToolContract>[0] = listReference;
-  const pending = runToolContract(definition, input);
+async function invoke(input: Record<string, unknown>, tenantId = 'default') {
+  const tenantState = tenantId === 'default' ? state : createMockContext({ tenantId }).state;
+  const handler: typeof listReference.handler = (input, ctx) =>
+    listReference.handler(input, { ...ctx, state: tenantState });
+  const definition: Parameters<typeof runToolContract>[0] = { ...listReference, handler };
+  const pending = runToolContract(definition, input, { context: { tenantId } });
   await vi.runAllTimersAsync();
   const result = await pending;
   const data = z.record(z.string(), z.unknown()).parse(result.structuredContent);
@@ -57,6 +62,138 @@ async function invoke(input: Record<string, unknown>) {
   return { result, data, text };
 }
 describe('reference contracts', () => {
+  it('retrieves oversized vocabulary fields losslessly through bounded Unicode record windows', async () => {
+    const name = 'é🌲'.repeat(3000);
+    body = [
+      { value: 'HUGE', name },
+      { value: 'SMALL', name: 'Small entry' },
+    ];
+    const first = await invoke({ topic: 'issue_codes' });
+    expect(first.result.isError, first.text).not.toBe(true);
+    expect(first.data).toMatchObject({
+      total_entries: 2,
+      matched_entries: 2,
+      records_deferred: 1,
+      entries: [{ value: 'SMALL', name: 'Small entry', source: 'lda' }],
+      output_complete: true,
+      truncated: true,
+    });
+    const handle = z
+      .array(z.object({ record_handle: z.string(), retrieval_tool: z.string() }))
+      .parse(first.data.record_handles)[0]!;
+    expect(handle.retrieval_tool).toBe('uslobbying_list_reference');
+    const root = await invoke({ record_handle: handle.record_handle });
+    expect(root.result.isError, root.text).not.toBe(true);
+    expect(root.data.record_window).toMatchObject({
+      kind: 'object',
+      entries: expect.arrayContaining([{ key: 'name', path: '/name' }]),
+    });
+    expect(root.data).not.toHaveProperty('entries');
+    let restored = '';
+    let offset = 0;
+    for (let index = 0; index < 250; index++) {
+      const result = await invoke({
+        record_handle: handle.record_handle,
+        record_path: '/name',
+        record_offset: offset,
+        record_limit: 25,
+      });
+      expect(result.result.isError, result.text).not.toBe(true);
+      expect(result.data).toMatchObject({
+        topic: 'issue_codes',
+        total_entries: 2,
+        matched_entries: 2,
+      });
+      const window = z
+        .object({
+          text: z.string(),
+          total: z.number(),
+          complete: z.boolean(),
+          next_offset: z.number().optional(),
+        })
+        .parse(result.data.record_window);
+      expect(window.total).toBe(6000);
+      restored += window.text;
+      if (window.complete) break;
+      offset = z.number().parse(window.next_offset);
+    }
+    expect(restored).toBe(name);
+    const past = await invoke({
+      record_handle: handle.record_handle,
+      record_path: '/name',
+      record_offset: 6000,
+    });
+    expect(past.data.record_window).toMatchObject({ text: '', returned: 0, complete: true });
+    const conflict = await invoke({ record_handle: handle.record_handle, topic: 'issue_codes' });
+    expect(conflict.data).toMatchObject({ error: { data: { reason: 'invalid_filter' } } });
+    expect(conflict.text).toContain('invalid_filter');
+    expect(calls).toHaveLength(1);
+  });
+  it('rejects foreign tenant and expired vocabulary cursors without reacquiring', async () => {
+    body = Array.from({ length: 140 }, (_, index) => ({
+      value: String(index),
+      name: 'Tiny entry',
+    }));
+    const first = await invoke({ topic: 'issue_codes' });
+    expect(first.result.isError, first.text).not.toBe(true);
+    expect(first.data.records_returned).toBe(125);
+    const foreign = await invoke({ cursor: first.data.next_cursor }, 'foreign');
+    expect(foreign.data).toMatchObject({ error: { data: { reason: 'cursor_invalid' } } });
+    expect(foreign.text).toContain('cursor_invalid');
+    const expires = Date.parse(z.string().parse(first.data.cursor_expires_at));
+    await vi.advanceTimersByTimeAsync(expires - Date.now() + 1);
+    const expired = await invoke({ cursor: first.data.next_cursor });
+    expect(expired.data).toMatchObject({ error: { data: { reason: 'cursor_invalid' } } });
+    expect(expired.text).toContain('cursor_invalid');
+    expect(calls).toHaveLength(1);
+  });
+  it('delivers a large complete vocabulary in lossless bounded cursor windows', async () => {
+    const entries = Array.from({ length: 180 }, (_, index) => ({
+      value: String(index).padStart(3, '0'),
+      name: `Synthetic vocabulary ${index} ${'é🌲'.repeat(90)}`,
+    }));
+    body = entries;
+    const first = await invoke({ topic: 'issue_codes', filter: 'synthetic' });
+    expect(first.result.isError, first.text).not.toBe(true);
+    expect(first.data).toMatchObject({
+      total_entries: 180,
+      matched_entries: 180,
+      output_complete: false,
+      truncated: true,
+      offset: 0,
+    });
+    expect(first.data.next_cursor).toEqual(expect.any(String));
+    const second = await invoke({
+      cursor: first.data.next_cursor,
+      topic: 'issue_codes',
+      filter: 'synthetic',
+    });
+    expect(second.result.isError, second.text).not.toBe(true);
+    const replay = await invoke({ cursor: first.data.next_cursor });
+    expect(replay.data).toEqual(second.data);
+    const changed = await invoke({ cursor: second.data.next_cursor, filter: 'different' });
+    expect(changed.result.isError).toBe(true);
+    expect(changed.data).toMatchObject({ error: { data: { reason: 'invalid_filter' } } });
+    expect(changed.text).toContain('invalid_filter');
+    const received = [...z.array(z.unknown()).parse(first.data.entries)];
+    let output = second;
+    for (let index = 0; index < 100; index++) {
+      expect(output.result.isError, output.text).not.toBe(true);
+      expect(output.data).toMatchObject({
+        total_entries: 180,
+        matched_entries: 180,
+        offset: received.length,
+        records_deferred: 0,
+      });
+      received.push(...z.array(z.unknown()).parse(output.data.entries));
+      if (output.data.output_complete) break;
+      expect(output.data.truncated).toBe(true);
+      output = await invoke({ cursor: output.data.next_cursor });
+    }
+    expect(output.data).toMatchObject({ output_complete: true, truncated: false });
+    expect(received).toEqual(entries.map((entry) => ({ ...entry, source: 'lda' })));
+    expect(calls).toHaveLength(1);
+  });
   it('shares one 45-second budget across LDA constants retries and the FARA country snapshot', async () => {
     const started = Date.now();
     const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
@@ -119,12 +256,24 @@ describe('reference contracts', () => {
   it.each(['issue_codes', 'filing_types', 'government_entities', 'contribution_types'])(
     'loads complete %s vocabulary and token-AND filters locally',
     async (topic) => {
+      if (topic === 'government_entities')
+        body = [
+          { id: 1, name: 'Telecommunications' },
+          { id: 2, name: 'Science Technology' },
+          { id: 3, name: 'Health Issues' },
+        ];
       const result = await invoke({ topic, filter: ' science TECHNOLOGY ' });
       expect(result.result.isError, result.text).not.toBe(true);
       expect(result.data).toMatchObject({
         total_entries: 3,
         matched_entries: 1,
-        entries: [{ value: 'SCI', name: 'Science Technology', source: 'lda' }],
+        entries: [
+          {
+            value: topic === 'government_entities' ? '2' : 'SCI',
+            name: 'Science Technology',
+            source: 'lda',
+          },
+        ],
       });
       expect(calls).toHaveLength(1);
       expect(calls[0]?.search).toBe('');

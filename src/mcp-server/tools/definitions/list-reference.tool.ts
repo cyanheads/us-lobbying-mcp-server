@@ -1,9 +1,18 @@
 /** @fileoverview Official vocabularies and source-specific interpretation guidance. @module mcp-server/tools/definitions/list-reference.tool */
+import { createHash } from 'node:crypto';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
-import { SOURCE_CACHE_TTL_MS } from '@/domain/contracts.js';
+import {
+  RecordHandleSchema,
+  RecordWindowInputShape,
+  RecordWindowSchema,
+  SOURCE_CACHE_TTL_MS,
+} from '@/domain/contracts.js';
 import { formatResult } from '@/domain/format.js';
+import { JsonValueSchema, optionalText } from '@/domain/json.js';
+import { resolveCheckpoint, serveResults } from '@/services/acquisition/acquisition-service.js';
+import { readRecordWindow } from '@/services/acquisition/record-window.js';
 import { getFaraService } from '@/services/fara/fara-service.js';
 import { getLdaService } from '@/services/lda/lda-service.js';
 
@@ -27,12 +36,54 @@ const Entry = z
   .describe('One attributed vocabulary entry or methodology explanation.');
 const Output = z.object({
   topic: Topic.describe('Requested vocabulary.'),
-  entries: z.array(Entry).describe('Complete locally filtered vocabulary.'),
+  entries: z
+    .array(Entry)
+    .optional()
+    .describe('Complete entries delivered in this pinned vocabulary window.'),
   total_entries: z.number().int().describe('Entries before local filtering.'),
   matched_entries: z.number().int().describe('Entries matching every literal filter token.'),
   retrieved_at: z.string().describe('Vocabulary retrieval timestamp.'),
   source_urls: z.array(z.string()).describe('Official source references.'),
   notices: z.array(z.string()).describe('Source limitations and empty-result recovery.'),
+  next_cursor: z.string().optional().describe('Opaque continuation of the pinned vocabulary.'),
+  output_complete: z
+    .boolean()
+    .optional()
+    .describe('Every matched entry has been delivered or deferred.'),
+  truncated: z.boolean().describe('More entries or deferred record values remain retrievable.'),
+  offset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Start position in the pinned filtered vocabulary.'),
+  records_returned: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Complete entries delivered in this window.'),
+  records_deferred: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Oversized entries retained behind handles.'),
+  record_handles: z
+    .array(RecordHandleSchema)
+    .optional()
+    .describe('Oversized entries retrievable through this same tool.'),
+  cursor_expires_at: z
+    .string()
+    .optional()
+    .describe('Absolute expiry of retained entries and continuations.'),
+  record_window: RecordWindowSchema.optional().describe(
+    'Exact recursive window of a deferred vocabulary entry.',
+  ),
+  retrieval_tool: z
+    .literal('uslobbying_list_reference')
+    .optional()
+    .describe('Tool used to retrieve deferred vocabulary entries.'),
 });
 type Entries = z.infer<typeof Entry>[];
 const cache = new Map<
@@ -167,17 +218,60 @@ const authored: Record<string, Entries> = {
 /** Decode reference codes before querying and inspect source accounting limitations. */
 export const listReference = tool('uslobbying_list_reference', {
   description:
-    'List official issue codes, filing types, government entities, contribution types and countries, or explain identifiers, methodology and FARA rules. Optional filter performs case-insensitive literal token-AND matching across the complete vocabulary. Countries include separately attributed LDA codes and FARA source labels; FARA labels are not guessed ISO codes.',
+    'List official issue codes, filing types, government entities, contribution types and countries, or explain identifiers, methodology and FARA rules. Optional filter performs case-insensitive literal token-AND matching across the complete vocabulary. Follow next_cursor for pinned result windows; retrieve oversized entries with this tool using record_handle and record_path. Countries include separately attributed LDA codes and FARA source labels; FARA labels are not guessed ISO codes.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.strictObject({
-    topic: Topic.describe('Vocabulary or explanatory topic.'),
+    topic: z
+      .preprocess(
+        (value) => (typeof value === 'string' ? optionalText(value)?.toLowerCase() : value),
+        Topic.optional(),
+      )
+      .describe('Vocabulary or explanatory topic; required on the first call.'),
     filter: z
       .string()
       .optional()
       .describe('Every whitespace-separated token must occur literally in an entry.'),
+    cursor: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe('Pinned continuation; omit original topic/filter or repeat them unchanged.'),
+    ...RecordWindowInputShape,
   }),
   output: Output,
   errors: [
+    {
+      reason: 'invalid_filter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Topic is missing, continuation scope changes, or record selectors conflict or select an invalid path.',
+      recovery:
+        'Call uslobbying_list_reference with a topic to start; repeat original filters unchanged for cursor calls, or use record_handle with only record selectors.',
+    },
+    {
+      reason: 'cursor_invalid',
+      code: JsonRpcErrorCode.ValidationError,
+      thrownBy: 'service',
+      when: 'A cursor or record handle is unavailable, expired or belongs to another tenant or tool.',
+      recovery:
+        'Restart uslobbying_list_reference with the original topic and filter, omitting cursor and record_handle.',
+    },
+    {
+      reason: 'acquisition_storage_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      when: 'Storage cannot retain the complete vocabulary or its checkpoint safely.',
+      recovery:
+        'Retry the last uslobbying_list_reference cursor after storage becomes available, or restart with a narrower literal filter.',
+    },
+    {
+      reason: 'result_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      thrownBy: 'service',
+      when: 'Complete metadata leaves no space for a result window.',
+      recovery:
+        'Retry uslobbying_list_reference with a narrower filter, or select a deeper record_path for a retained entry.',
+    },
     {
       reason: 'source_schema_changed',
       code: JsonRpcErrorCode.SerializationError,
@@ -197,7 +291,57 @@ export const listReference = tool('uslobbying_list_reference', {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    let value = cache.get(input.topic);
+    const filter = optionalText(input.filter)?.toLowerCase().split(/\s+/).join(' ');
+    const filters = { ...(input.topic && { topic: input.topic }), ...(filter && { filter }) };
+    if (input.record_handle) {
+      if (Object.keys(filters).length || input.cursor)
+        throw ctx.fail(
+          'invalid_filter',
+          'record_handle is exclusive with topic, filter and cursor.',
+        );
+      return Output.parse(
+        await readRecordWindow(ctx, {
+          ...input,
+          tool: 'uslobbying_list_reference',
+          record_handle: input.record_handle,
+        }),
+      );
+    }
+    if (input.record_path !== '' || input.record_offset !== 0 || input.record_limit !== 25)
+      throw ctx.fail('invalid_filter', 'Record selectors require record_handle.');
+    const checkpoint = input.cursor
+      ? await resolveCheckpoint(ctx, { tool: 'uslobbying_list_reference', cursor: input.cursor })
+      : undefined;
+    const topic = Topic.optional().parse(checkpoint?.filters.topic ?? input.topic);
+    if (!topic)
+      throw ctx.fail('invalid_filter', 'topic is required to start a vocabulary request.');
+    const deliver = async (records?: Entries, provenance = checkpoint?.provenance ?? {}) => {
+      const result = await serveResults(ctx, {
+        tool: 'uslobbying_list_reference',
+        scanKind: 'reference',
+        filters,
+        provenance,
+        ...(input.cursor && { cursor: input.cursor }),
+        ...(records && { records: z.array(JsonValueSchema).parse(records) }),
+        maxRecords: 125,
+        identify: (record) => createHash('sha256').update(JSON.stringify(record)).digest('hex'),
+        buildResponse: (window, _metadata, stored) => ({
+          ...stored,
+          entries: window.records,
+          ...(window.next_cursor && { next_cursor: window.next_cursor }),
+          output_complete: window.output_complete,
+          truncated: window.truncated,
+          offset: window.offset,
+          records_returned: window.records_returned,
+          records_deferred: window.records_deferred,
+          record_handles: window.record_handles,
+          cursor_expires_at: window.cursor_expires_at,
+        }),
+      });
+      return Output.parse(result.response);
+    };
+    if (checkpoint) return deliver();
+    let value = cache.get(topic);
     if (!value || value.expires <= Date.now()) {
       let entries: Entries;
       const source_urls = [
@@ -205,7 +349,7 @@ export const listReference = tool('uslobbying_list_reference', {
         'https://lobbyingdisclosure.house.gov/ldaguidance.pdf',
       ];
       let retrieved_at = new Date().toISOString();
-      const explanations = authored[input.topic];
+      const explanations = authored[topic];
       if (explanations) entries = explanations;
       else {
         const constants = await getLdaService().constants(
@@ -217,7 +361,7 @@ export const listReference = tool('uslobbying_list_reference', {
               'contribution_types',
               'countries',
             ])
-            .parse(input.topic),
+            .parse(topic),
           {
             signal: ctx.signal,
           },
@@ -227,7 +371,7 @@ export const listReference = tool('uslobbying_list_reference', {
           name: row.name,
           source: 'lda',
         }));
-        if (input.topic === 'countries') {
+        if (topic === 'countries') {
           const fara = await getFaraService().countries(ctx.signal);
           entries.push(
             ...fara.countries.map((country) => ({
@@ -241,17 +385,16 @@ export const listReference = tool('uslobbying_list_reference', {
         }
       }
       value = { expires: Date.now() + SOURCE_CACHE_TTL_MS, entries, retrieved_at, source_urls };
-      cache.set(input.topic, value);
+      cache.set(topic, value);
     }
-    const tokens = input.filter?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? [];
+    const tokens = filter?.split(' ') ?? [];
     const entries = value.entries.filter((entry) =>
       tokens.every((token) =>
         [entry.value, entry.name, entry.description ?? ''].join(' ').toLowerCase().includes(token),
       ),
     );
-    return {
-      topic: input.topic,
-      entries,
+    return deliver(entries, {
+      topic,
       total_entries: value.entries.length,
       matched_entries: entries.length,
       retrieved_at: value.retrieved_at,
@@ -261,7 +404,8 @@ export const listReference = tool('uslobbying_list_reference', {
         : [
             'No reference entries matched; call uslobbying_list_reference with the same topic and omit filter.',
           ],
-    };
+      retrieval_tool: 'uslobbying_list_reference',
+    });
   },
   format: formatResult,
 });

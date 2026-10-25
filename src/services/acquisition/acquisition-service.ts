@@ -499,7 +499,7 @@ export async function serveResults(
     .number()
     .int()
     .min(1)
-    .max(25)
+    .max(125)
     .parse(options.maxRecords ?? 25);
   const manifest = options.cursor
     ? await load(ctx, options.cursor, options.tool, options.scanKind, options.filters)
