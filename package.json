@@ -62,6 +62,9 @@
     "ai-agents",
     "ai-tools",
     "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
     "cyanheads"
   ],
   "repository": {

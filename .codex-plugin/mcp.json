@@ -3,10 +3,8 @@
     "command": "npx",
     "args": ["-y", "@cyanheads/us-lobbying-mcp-server"],
     "env": {
-      "MCP_TRANSPORT_TYPE": "stdio",
-      "USLOBBYING_LDA_API_KEY": "${USLOBBYING_LDA_API_KEY}",
-      "USLOBBYING_DATAFRAME_DROP_ENABLED": "${USLOBBYING_DATAFRAME_DROP_ENABLED}",
-      "CANVAS_PROVIDER_TYPE": "${CANVAS_PROVIDER_TYPE}"
-    }
+      "MCP_TRANSPORT_TYPE": "stdio"
+    },
+    "env_vars": ["USLOBBYING_LDA_API_KEY", "USLOBBYING_DATAFRAME_DROP_ENABLED", "CANVAS_PROVIDER_TYPE"]
   }
 }

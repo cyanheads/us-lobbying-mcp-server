@@ -11,16 +11,40 @@
   "homepage": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
   "repository": "https://github.com/cyanheads/us-lobbying-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "lobbying", "lda", "fara", "disclosures", "ai-agents", "ai-tools", "typescript", "cyanheads"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "lobbying", "lda", "fara", "disclosures", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads"],
+  "userConfig": {
+    "USLOBBYING_LDA_API_KEY": {
+      "title": "LDA API token",
+      "description": "Optional registered LDA token for the authenticated request allowance. Anonymous access works without a token.",
+      "type": "string",
+      "sensitive": true,
+      "required": false,
+      "default": ""
+    },
+    "USLOBBYING_DATAFRAME_DROP_ENABLED": {
+      "title": "Enable table deletion",
+      "description": "Expose the local dataframe table deletion tool.",
+      "type": "boolean",
+      "required": false,
+      "default": false
+    },
+    "CANVAS_PROVIDER_TYPE": {
+      "title": "SQL canvas provider",
+      "description": "Set duckdb to enable local SQL; none keeps complete inline analytical delivery.",
+      "type": "string",
+      "required": false,
+      "default": "none"
+    }
+  },
   "mcpServers": {
     "us-lobbying-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/us-lobbying-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
-        "USLOBBYING_LDA_API_KEY": "${USLOBBYING_LDA_API_KEY}",
-        "USLOBBYING_DATAFRAME_DROP_ENABLED": "${USLOBBYING_DATAFRAME_DROP_ENABLED}",
-        "CANVAS_PROVIDER_TYPE": "${CANVAS_PROVIDER_TYPE}"
+        "USLOBBYING_LDA_API_KEY": "${user_config.USLOBBYING_LDA_API_KEY}",
+        "USLOBBYING_DATAFRAME_DROP_ENABLED": "${user_config.USLOBBYING_DATAFRAME_DROP_ENABLED}",
+        "CANVAS_PROVIDER_TYPE": "${user_config.CANVAS_PROVIDER_TYPE}"
       }
     }
   }
