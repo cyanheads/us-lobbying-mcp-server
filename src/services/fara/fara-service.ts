@@ -281,9 +281,8 @@ export class FaraService {
       if (signal.aborted) throw signal.reason;
       if (!(cause instanceof McpError)) throw cause;
       if (
-        cause instanceof McpError &&
-        (cause.code === JsonRpcErrorCode.RateLimited ||
-          cause.data?.reason === 'source_schema_changed')
+        cause.code === JsonRpcErrorCode.RateLimited ||
+        cause.data?.reason === 'source_schema_changed'
       )
         throw cause;
       throw serviceUnavailable(

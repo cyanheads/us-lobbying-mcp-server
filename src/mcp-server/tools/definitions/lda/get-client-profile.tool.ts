@@ -1,11 +1,12 @@
 /** @fileoverview Resolve client relationships and analyze explicitly selected IDs. @module mcp-server/tools/definitions/lda/getClientProfile */
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
 import { formatResult } from '@/domain/format.js';
 import { ClientSchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
-import { analyticalShape, analyzeScope, CanvasIdSchema } from './analytics.js';
+import { analyticalShape, analyzeScope } from './analytics.js';
 import {
   commonInput,
   deliveryShape,

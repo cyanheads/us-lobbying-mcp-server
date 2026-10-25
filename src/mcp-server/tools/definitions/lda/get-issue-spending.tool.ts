@@ -1,9 +1,10 @@
 /** @fileoverview Analyze amounts on selected filings mentioning an issue. @module mcp-server/tools/definitions/lda/getIssueSpending */
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
 import { formatResult } from '@/domain/format.js';
-import { analyticalShape, analyzeScope, CanvasIdSchema } from './analytics.js';
+import { analyticalShape, analyzeScope } from './analytics.js';
 import {
   commonInput,
   id,

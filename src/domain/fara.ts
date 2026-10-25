@@ -51,15 +51,6 @@ export const FaraDocumentWireSchema = z
     FOREIGN_PRINCIPAL_COUNTRY: text.describe('Related principal country/location.'),
   })
   .catchall(JsonValueSchema);
-/** Registrant listing wire shape; addresses and business names are sparse. */
-export const FaraRegistrantWireSchema = z
-  .object({
-    Registration_Number: SourceIdSchema.describe('Registration number.'),
-    Name: z.string().describe('Registrant name.'),
-    Registration_Date: text.describe('Raw registration date.'),
-    Business_Name: text.describe('Optional disclosed business name.'),
-  })
-  .catchall(JsonValueSchema);
 /** Only verified detail envelope alternatives are accepted. */
 export function faraDetailEnvelopeSchema<T extends z.ZodType>(record: T) {
   return z

@@ -23,7 +23,8 @@ export const RegistrantSchema = z
     house_registrant_id: IdSchema.nullable().optional().describe('House identifier when supplied.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Registrant relationship identity and disclosed fields.');
+  .describe('Registrant relationship identity and disclosed fields.')
+  .meta({ id: 'LdaRegistrant' });
 /** Client IDs identify a registrant relationship, not a merged corporate entity. */
 export const ClientSchema = z
   .object({
@@ -37,7 +38,8 @@ export const ClientSchema = z
     registrant: RegistrantSchema.optional().describe('Registrant embedded by client search.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Client relationship and its complete source fields.');
+  .describe('Client relationship and its complete source fields.')
+  .meta({ id: 'LdaClient' });
 /** Lobbyist identity; covered positions belong to filing activity membership instead. */
 export const LobbyistSchema = z
   .object({
@@ -48,7 +50,8 @@ export const LobbyistSchema = z
     registrant: RegistrantSchema.optional().describe('Registrant embedded by identity search.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Disclosed lobbyist identity.');
+  .describe('Disclosed lobbyist identity.')
+  .meta({ id: 'LdaLobbyist' });
 /** Filing-scoped participant and covered-position disclosure. */
 export const ActivityLobbyistSchema = z
   .object({
@@ -59,7 +62,8 @@ export const ActivityLobbyistSchema = z
     new: z.boolean().nullable().optional().describe('Source new-lobbyist flag.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Filing-scoped lobbyist participation.');
+  .describe('Filing-scoped lobbyist participation.')
+  .meta({ id: 'LdaActivityLobbyist' });
 /** Activity has no money amount; filing amounts must never be multiplied by activity joins. */
 export const LobbyingActivitySchema = z
   .object({
@@ -76,7 +80,8 @@ export const LobbyingActivitySchema = z
       .describe('Complete targeted government entities.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Complete reported lobbying activity.');
+  .describe('Complete reported lobbying activity.')
+  .meta({ id: 'LdaLobbyingActivity' });
 /** Derived activity identity is shared by analytical output and SQL staging. */
 export const ActivityRowSchema = LobbyingActivitySchema.extend({
   filing_uuid: z.string().describe('Parent filing UUID.'),
@@ -124,7 +129,8 @@ export const FilingSchema = z
     affiliated_organizations: z.array(JsonValueSchema).optional().describe('Complete affiliates.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Complete source filing, including unknown disclosures.');
+  .describe('Complete source filing, including unknown disclosures.')
+  .meta({ id: 'LdaFiling' });
 /** Contribution child retains membership and repeated identical items. */
 export const ContributionItemSchema = z
   .object({

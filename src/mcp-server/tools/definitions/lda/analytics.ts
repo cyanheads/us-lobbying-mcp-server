@@ -1,6 +1,5 @@
 /** @fileoverview Typed analytical rows and complete-scope finalization. @module mcp-server/tools/definitions/lda/analytics */
 import { type Context, z } from '@cyanheads/mcp-ts-core';
-import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { CoverageSchema, DatasetSchema } from '@/domain/contracts.js';
 import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
 import { ActivityRowSchema, FilingSchema, GovernmentEntitySchema } from '@/domain/lda.js';
@@ -8,8 +7,6 @@ import { acquire } from '@/services/acquisition/acquisition-service.js';
 import { getCanvas, stageFilings } from '@/services/canvas/canvas-service.js';
 import { analyzeFilings } from '@/services/lobbying/analysis.js';
 import { deliveryShape, envelope, provenance, source } from './shared.js';
-
-export { CanvasIdSchema };
 
 const RowSetCounts = z
   .object({
@@ -24,7 +21,7 @@ const RowSetCounts = z
   })
   .describe('Record counts for each analytical set.');
 
-export const Ledger = z
+const Ledger = z
   .object({
     year: z.number().int().describe('Report year.'),
     known_income_usd: z
@@ -56,7 +53,8 @@ export const Ledger = z
       )
       .describe('Separate expense-method ledgers.'),
   })
-  .describe('Annual income and expense ledgers, kept separate.');
+  .describe('Annual income and expense ledgers, kept separate.')
+  .meta({ id: 'LdaAnnualLedger' });
 const Selection = z
   .object({
     candidate_filing_uuids: z.array(z.string()).describe('Latest candidates.'),
@@ -98,7 +96,7 @@ const TargetedEntity = z
     filing_uuids: z.array(z.string()).describe('Source reports.'),
   })
   .describe('Government entity and supporting filings.');
-export const AnalyticalRow = z.discriminatedUnion('kind', [
+const AnalyticalRow = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('activity'),
     activity: ActivityRowSchema.describe(
