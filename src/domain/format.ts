@@ -21,7 +21,7 @@ export function formatResult(result: object): { type: 'text'; text: string }[] {
         !url.username &&
         !url.password
       )
-        links.add(value);
+        links.add(url.href);
     } else if (Array.isArray(value)) {
       for (const item of value) visit(item);
     } else if (value !== null && typeof value === 'object') {

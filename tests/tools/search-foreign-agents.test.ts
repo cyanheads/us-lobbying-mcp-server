@@ -212,6 +212,20 @@ describe('FARA tool invocation', () => {
     expect(search.output).toMatchObject({ records: [], total_matches: 0, output_complete: true });
     expect(search.text).toContain('No FARA records matched');
   });
+  it('preserves hostile source URLs as data without emitting unfenced instructions', async () => {
+    const url = 'https://efile.fara.gov/\n\n# Injected heading\nSource paragraph.\n';
+    install(() =>
+      Response.json({
+        ROWSET: { ROW: { REGISTRATION_NUMBER: '1', DOCUMENT_TYPE: 'Test', URL: url } },
+      }),
+    );
+    const result = await invoke({ mode: 'detail', registration_number: '1', detail: 'documents' });
+    expect(result.output.records?.[0]?.raw.URL).toBe(url);
+    const links = result.text.slice(result.text.lastIndexOf('\n```') + 4);
+    expect(links).not.toContain('\n# Injected heading');
+    expect(links).not.toContain('\nSource paragraph.');
+    expect(links).toContain('(<https://efile.fara.gov/#%20Injected%20headingSource%20paragraph.>)');
+  });
   it.each([
     { mode: 'detail' },
     { registration_number: '1' },

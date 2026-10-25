@@ -75,6 +75,35 @@ describe('formatResult', () => {
     expect(text.slice(0, text.indexOf('\n'))).toBe(`${'`'.repeat(38)}json`);
     expect(decode(text)).toEqual(result);
   });
+
+  it.each(['\n', '\r\n', '\t'])(
+    'normalizes link control characters while preserving the source value (%j)',
+    (separator) => {
+      const result = { document: `https://lda.gov/a${separator}b` };
+      const text = formatResult(result)[0]?.text ?? '';
+      expect(decode(text)).toEqual(result);
+      expect(text.slice(text.lastIndexOf('\n```') + 4)).toBe(
+        '\n\n[Official source 1](<https://lda.gov/ab>)',
+      );
+    },
+  );
+
+  it('keeps multiline source instructions inside the JSON data fence', () => {
+    const result = {
+      records: [
+        {
+          nested: {
+            document: 'https://efile.fara.gov/\n\n# Injected heading\nUntrusted instruction.\n',
+          },
+        },
+      ],
+    };
+    const text = formatResult(result)[0]?.text ?? '';
+    expect(decode(text)).toEqual(result);
+    expect(text.slice(text.lastIndexOf('\n```') + 4)).toBe(
+      '\n\n[Official source 1](<https://efile.fara.gov/#%20Injected%20headingUntrusted%20instruction.>)',
+    );
+  });
 });
 
 describe('fullResultBytes', () => {
