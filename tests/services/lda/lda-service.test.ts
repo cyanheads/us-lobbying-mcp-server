@@ -131,8 +131,12 @@ describe('LDA noun wiring', () => {
     },
   );
   it('fetches every official constants path', async () => {
-    const { service, calls } = source(() =>
-      Response.json([{ value: 'TEC', name: 'Synthetic label', extra: null }]),
+    const { service, calls } = source((url) =>
+      Response.json([
+        url.pathname === '/api/v1/constants/filing/governmententities/'
+          ? { id: 211, name: 'Synthetic board', extra: null }
+          : { value: 'TEC', name: 'Synthetic label', extra: null },
+      ]),
     );
     const paths = {
       issue_codes: 'filing/lobbyingactivityissues',
@@ -146,11 +150,41 @@ describe('LDA noun wiring', () => {
     } as const;
     for (const topic of Object.keys(paths) as (keyof typeof paths)[])
       expect(await settle(service.constants(topic))).toEqual([
-        { value: 'TEC', name: 'Synthetic label', extra: null },
+        topic === 'government_entities'
+          ? { id: '211', value: '211', name: 'Synthetic board', extra: null }
+          : { value: 'TEC', name: 'Synthetic label', extra: null },
       ]);
     expect(calls.map((x) => x.url.pathname)).toEqual(
       Object.values(paths).map((path) => `/api/v1/constants/${path}/`),
     );
+  });
+  it.each([211, '000211', '900719925474099312345'])(
+    'normalizes government entity constant identity %s without dropping source fields',
+    async (id) => {
+      const { service, calls } = source((url) => {
+        if (url.pathname !== '/api/v1/constants/filing/governmententities/')
+          throw new Error(`Unmatched ${url}`);
+        return Response.json([{ id, name: 'Synthetic board', future: { nested: [null, false] } }]);
+      });
+      expect(await settle(service.constants('government_entities'))).toEqual([
+        {
+          id: String(id),
+          value: String(id),
+          name: 'Synthetic board',
+          future: { nested: [null, false] },
+        },
+      ]);
+      expect(calls).toHaveLength(1);
+    },
+  );
+  it('rejects unsafe numeric government entity constants without retry', async () => {
+    const { service, calls } = source(() =>
+      Response.json([{ id: Number.MAX_SAFE_INTEGER + 1, name: 'Synthetic board' }]),
+    );
+    await expect(settle(service.constants('government_entities'))).rejects.toMatchObject({
+      data: { reason: 'source_schema_changed', retryable: false },
+    });
+    expect(calls).toHaveLength(1);
   });
   it('returns genuine empty pages and preserves huge string and safe integer identities', async () => {
     const { service } = source((url) =>

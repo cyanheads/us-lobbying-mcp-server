@@ -11,7 +11,7 @@ import {
 import { createPacer, type Pacer, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { EXCHANGE_DEADLINE_MS, TOOL_DEADLINE_MS } from '@/domain/contracts.js';
-import { JsonValueSchema } from '@/domain/json.js';
+import { IdSchema, JsonValueSchema } from '@/domain/json.js';
 import {
   ClientSchema,
   ContributionReportSchema,
@@ -396,9 +396,15 @@ export class LdaService {
   }
   /** Fetch an official reference family. */
   constants(topic: LdaConstantTopic, options: LdaRequestOptions = {}) {
+    const record =
+      topic === 'government_entities'
+        ? LdaConstantSchema.omit({ value: true })
+            .extend({ id: IdSchema })
+            .transform((entry) => ({ ...entry, value: entry.id }))
+        : LdaConstantSchema;
     return this.request(
       new URL(`constants/${constantPaths[topic]}/`, BASE),
-      z.array(LdaConstantSchema),
+      z.array(record),
       options,
     );
   }
