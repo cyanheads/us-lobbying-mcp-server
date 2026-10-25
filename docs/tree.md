@@ -1,6 +1,6 @@
 # us-lobbying-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 13:03:30
+Generated on: 2026-10-25 13:21:07
 
 ```text
 us-lobbying-mcp-server/
@@ -24,6 +24,7 @@ us-lobbying-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -219,6 +220,7 @@ us-lobbying-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
