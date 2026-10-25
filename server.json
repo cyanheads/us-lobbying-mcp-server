@@ -16,6 +16,27 @@
       "version": "0.1.0",
       "environmentVariables": [
         {
+          "name": "USLOBBYING_LDA_API_KEY",
+          "description": "Optional registered LDA API token; anonymous access works without it.",
+          "format": "string",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "USLOBBYING_DATAFRAME_DROP_ENABLED",
+          "description": "Enable the local dataframe table deletion tool.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "CANVAS_PROVIDER_TYPE",
+          "description": "Optional SQL canvas provider: none or duckdb.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -34,6 +55,27 @@
       "runtimeHint": "npx",
       "version": "0.1.0",
       "environmentVariables": [
+        {
+          "name": "USLOBBYING_LDA_API_KEY",
+          "description": "Optional registered LDA API token; anonymous access works without it.",
+          "format": "string",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "USLOBBYING_DATAFRAME_DROP_ENABLED",
+          "description": "Enable the local dataframe table deletion tool.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
+          "name": "CANVAS_PROVIDER_TYPE",
+          "description": "Optional SQL canvas provider: none or duckdb.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
         {
           "name": "MCP_TRANSPORT_TYPE",
           "description": "Selects the HTTP transport.",

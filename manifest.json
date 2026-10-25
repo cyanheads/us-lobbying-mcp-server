@@ -16,7 +16,10 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "CANVAS_PROVIDER_TYPE": "none",
+        "USLOBBYING_LDA_API_KEY": "${user_config.USLOBBYING_LDA_API_KEY}",
+        "USLOBBYING_DATAFRAME_DROP_ENABLED": "${user_config.USLOBBYING_DATAFRAME_DROP_ENABLED}"
       }
     }
   },
@@ -25,5 +28,21 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "USLOBBYING_LDA_API_KEY": {
+      "title": "LDA API token",
+      "description": "Optional registered LDA token for the authenticated request allowance. Anonymous access works without a token.",
+      "type": "string",
+      "sensitive": true,
+      "required": false,
+      "default": ""
+    },
+    "USLOBBYING_DATAFRAME_DROP_ENABLED": {
+      "title": "Enable table deletion",
+      "description": "Expose the local dataframe table deletion tool. SQL canvases are unavailable in this bundle.",
+      "type": "boolean",
+      "required": false,
+      "default": false
+    }
+  }
 }
