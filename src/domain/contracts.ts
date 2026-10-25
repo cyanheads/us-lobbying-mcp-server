@@ -70,7 +70,9 @@ export const RecordWindowInputShape = {
     .min(1)
     .max(25)
     .default(25)
-    .describe('Maximum child entries requested.'),
+    .describe(
+      'Maximum object entries or array items; text fragments use the response byte budget.',
+    ),
 };
 /** A deferred parent is not counted as a delivered full record. */
 export const RecordHandleSchema = z

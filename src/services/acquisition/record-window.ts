@@ -138,10 +138,9 @@ export async function readRecordWindow(
   if (typeof value === 'string') {
     const points = Array.from(value);
     if (input.record_offset > points.length) throw badPath();
-    let count = Math.min(input.record_limit, points.length - input.record_offset);
-    while (count >= 0) {
+    const fragment = (count: number) => {
       const next = input.record_offset + count;
-      const response = envelope({
+      return envelope({
         ...base,
         kind: 'string',
         total: points.length,
@@ -150,16 +149,24 @@ export async function readRecordWindow(
         text: points.slice(input.record_offset, next).join(''),
         ...(next < points.length ? { next_offset: next } : {}),
       });
-      if (fullResultBytes(response) <= FULL_RESULT_TARGET_BYTES) {
-        if (count === 0 && next < points.length)
-          throw validationError('Record-window metadata leaves no room for a Unicode code point.', {
-            reason: 'result_too_large',
-          });
-        return response;
-      }
-      count--;
+    };
+    const remaining = points.length - input.record_offset;
+    const complete = fragment(remaining);
+    if (fullResultBytes(complete) <= FULL_RESULT_TARGET_BYTES) return complete;
+    assertFits(fragment(0));
+    let lower = 0;
+    let upper = remaining - 1;
+    while (lower < upper) {
+      ctx.signal.throwIfAborted();
+      const middle = Math.ceil((lower + upper) / 2);
+      if (fullResultBytes(fragment(middle)) <= FULL_RESULT_TARGET_BYTES) lower = middle;
+      else upper = middle - 1;
     }
-    throw validationError('Record-window metadata cannot fit.', { reason: 'result_too_large' });
+    if (lower === 0)
+      throw validationError('Record-window metadata leaves no room for a Unicode code point.', {
+        reason: 'result_too_large',
+      });
+    return fragment(lower);
   }
   const array = Array.isArray(value);
   const keys = array ? value.map((_, index) => String(index)) : Object.keys(value).sort();

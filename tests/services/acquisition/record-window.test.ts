@@ -22,6 +22,85 @@ const options = {
 };
 
 describe('deferred records', () => {
+  it('windows strings by full wire bytes while record_limit caps only collection entries', async () => {
+    const ctx = createMockContext();
+    const original = '🌲漢é\n'.repeat(5000);
+    const result = await serveResults(ctx, {
+      ...options,
+      records: [{ text: original, array: [1, 2, 3], object: { a: 1, b: 2, c: 3 } }],
+    });
+    const record_handle =
+      (result.response as DeliveryWindow).record_handles[0]?.record_handle ?? '';
+    const request = { tool, record_handle, record_path: '/text' };
+    const first = await readRecordWindow(ctx, { ...request, record_limit: 25 });
+    const limited = await readRecordWindow(ctx, { ...request, record_limit: 2 });
+    expect(limited).toEqual(first);
+    let offset = 0;
+    let reconstructed = '';
+    let windows = 0;
+    do {
+      const response = await readRecordWindow(ctx, {
+        ...request,
+        record_limit: 25,
+        record_offset: offset,
+      });
+      const parsed = JsonValueSchema.parse(response);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+        throw new Error('Expected envelope');
+      const window = RecordWindowSchema.parse(parsed.record_window);
+      if (window.kind !== 'string') throw new Error('Expected string window');
+      expect(window.returned).toBe(Array.from(window.text).length);
+      expect(window.text).toBe(
+        Array.from(original)
+          .slice(offset, offset + window.returned)
+          .join(''),
+      );
+      expect(window.returned).toBeGreaterThan(25);
+      const content = formatResult(response);
+      const text = content[0]?.text ?? '';
+      const fence = text.slice(0, text.indexOf('json\n'));
+      expect(JSON.parse(text.slice(fence.length + 5, text.lastIndexOf(`\n${fence}`)))).toEqual(
+        response,
+      );
+      expect(
+        Buffer.byteLength(JSON.stringify({ content, structuredContent: response }), 'utf8') + 512,
+      ).toBeLessThanOrEqual(24_000);
+      reconstructed += window.text;
+      windows++;
+      if (window.next_offset === undefined) {
+        expect(window.complete).toBe(true);
+        break;
+      }
+      expect(window.next_offset).toBe(offset + window.returned);
+      const nextPoint = Array.from(original)[window.next_offset];
+      const enlarged = {
+        ...parsed,
+        record_window: {
+          ...window,
+          text: window.text + nextPoint,
+          returned: window.returned + 1,
+          next_offset: window.next_offset + 1,
+        },
+      };
+      expect(
+        Buffer.byteLength(
+          JSON.stringify({ content: formatResult(enlarged), structuredContent: enlarged }),
+          'utf8',
+        ) + 512,
+      ).toBeGreaterThan(24_000);
+      offset = window.next_offset;
+    } while (offset < Array.from(original).length);
+    expect(reconstructed).toBe(original);
+    expect(windows).toBeGreaterThan(2);
+    for (const record_path of ['/array', '/object']) {
+      await expect(
+        readRecordWindow(ctx, { tool, record_handle, record_path, record_limit: 2 }),
+      ).resolves.toMatchObject({ record_window: { returned: 2, next_offset: 2, complete: false } });
+      await expect(
+        readRecordWindow(ctx, { tool, record_handle, record_path, record_limit: 25 }),
+      ).resolves.toMatchObject({ record_window: { returned: 3, complete: true } });
+    }
+  });
   it('retains complete coverage and expiry in a finalized deferred parent', async () => {
     const ctx = createMockContext();
     const result = await serveResults(ctx, { ...options, records: [{ huge: 'x'.repeat(20_000) }] });

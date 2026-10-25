@@ -679,14 +679,21 @@ describe('LDA runtime contracts', () => {
         record_limit: 25,
       }),
     );
+    const fragment = z.object({ text: z.string() }).parse(window.record_window).text;
+    const codePoints = Array.from(fragment).length;
+    expect(codePoints).toBeGreaterThan(25);
+    expect(fragment).toBe(
+      Array.from(long)
+        .slice(1, 1 + codePoints)
+        .join(''),
+    );
     expect(window.record_window).toMatchObject({
       kind: 'string',
-      text: `${'🌲é'.repeat(12)}🌲`,
       offset: 1,
-      returned: 25,
+      returned: codePoints,
       total: 18000,
       complete: false,
-      next_offset: 26,
+      next_offset: 1 + codePoints,
     });
     const past = success(
       await invoke(searchFilings, {
