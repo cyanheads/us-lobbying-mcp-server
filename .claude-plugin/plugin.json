@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "us-lobbying-mcp-server",
+  "version": "0.1.0",
+  "description": "Search US lobbying disclosures and foreign-agent registrations via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/us-lobbying-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "lobbying", "lda", "fara", "disclosures", "ai-agents", "ai-tools", "typescript", "cyanheads"],
+  "mcpServers": {
+    "us-lobbying-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/us-lobbying-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}

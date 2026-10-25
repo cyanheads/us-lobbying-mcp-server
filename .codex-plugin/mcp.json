@@ -1,0 +1,9 @@
+{
+  "us-lobbying-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/us-lobbying-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}

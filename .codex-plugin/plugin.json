@@ -1,0 +1,25 @@
+{
+  "name": "us-lobbying-mcp-server",
+  "version": "0.1.0",
+  "description": "Search US lobbying disclosures and foreign-agent registrations via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/us-lobbying-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "lobbying", "lda", "fara", "disclosures", "ai-agents", "ai-tools", "typescript", "cyanheads"],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "us-lobbying-mcp-server",
+    "shortDescription": "Search US lobbying disclosures and foreign-agent registrations via MCP.",
+    "longDescription": "Explore federal lobbying disclosures from the US Senate Office of Public Records and foreign-agent registrations from the US Department of Justice. These primary sources connect lobbying activity, registrants, clients, and foreign principals through a read-only MCP interface.",
+    "developerName": "cyanheads",
+    "category": "research",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
+    "defaultPrompt": []
+  }
+}
