@@ -11,7 +11,7 @@
   "homepage": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
   "repository": "https://github.com/cyanheads/us-lobbying-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "lobbying", "lda", "fara", "disclosures", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "lobbying", "lda", "fara", "disclosures", "lobbying-disclosure", "foreign-agents", "government-transparency", "open-data", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads"],
   "userConfig": {
     "USLOBBYING_LDA_API_KEY": {
       "title": "LDA API token",

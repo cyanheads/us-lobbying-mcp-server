@@ -1,0 +1,34 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "us-lobbying-mcp-server",
+  "version": "0.1.1",
+  "description": "Search US lobbying disclosures and foreign-agent registrations via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/us-lobbying-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "lobbying",
+    "lda",
+    "fara",
+    "disclosures",
+    "lobbying-disclosure",
+    "foreign-agents",
+    "government-transparency",
+    "open-data",
+    "ai-agents",
+    "ai-tools",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "cyanheads"
+  ]
+}
