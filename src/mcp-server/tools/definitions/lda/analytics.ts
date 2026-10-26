@@ -1,6 +1,6 @@
 /** @fileoverview Typed analytical rows and complete-scope finalization. @module mcp-server/tools/definitions/lda/analytics */
 import { type Context, z } from '@cyanheads/mcp-ts-core';
-import { CoverageSchema, DatasetSchema } from '@/domain/contracts.js';
+import { CanvasPointersShape, CoverageSchema, DatasetSchema } from '@/domain/contracts.js';
 import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
 import { ActivityRowSchema, FilingSchema, GovernmentEntitySchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
@@ -20,6 +20,16 @@ const RowSetCounts = z
     raw_filings: z.number().int().nonnegative().describe('Acquired filing versions.'),
   })
   .describe('Record counts for each analytical set.');
+
+/** Inline selection changes delivery only; complete analysis and SQL staging retain every set. */
+export const rowSetsInput = z
+  .array(RowSetCounts.keyof())
+  .min(1)
+  .refine((sets) => new Set(sets).size === sets.length, 'row_sets must contain unique names.')
+  .optional()
+  .describe(
+    'Inline analytical sets; omit for all sets. Selection never limits acquisition, totals or SQL staging. Omitted sets remain available from a new call with another selection or staged tables. Continue with omitted or equivalent row_sets.',
+  );
 
 const Ledger = z
   .object({
@@ -97,6 +107,7 @@ const TargetedEntity = z
   })
   .describe('Government entity and supporting filings.');
 const AnalyticalRow = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('notice'), notice: z.string() }),
   z.object({
     kind: z.literal('activity'),
     activity: ActivityRowSchema.describe(
@@ -135,14 +146,16 @@ const AnalyticalRow = z.discriminatedUnion('kind', [
 ]);
 export const analyticalShape = {
   ...deliveryShape,
-  canvas_available: z
-    .boolean()
-    .describe('Whether SQL canvas support is enabled on this installation.'),
+  canvas_id: CanvasPointersShape.canvas_id.optional(),
+  describe_tool: CanvasPointersShape.describe_tool.optional(),
+  query_tool: CanvasPointersShape.query_tool.optional(),
+  guidance: CanvasPointersShape.guidance.optional(),
+  canvas_available: z.boolean().describe('SQL canvas support is enabled.'),
   row_set_totals: RowSetCounts.optional().describe(
-    'Exact complete-set totals, available only after acquisition completes.',
+    'Exact all-set totals after acquisition completes.',
   ),
   row_set_offsets: RowSetCounts.optional().describe(
-    'Records delivered or deferred before this window in each set; continue the shared cursor.',
+    'Selected-set rows delivered or deferred before this window; others zero.',
   ),
   status: z
     .enum(['collecting', 'complete'])
@@ -150,34 +163,28 @@ export const analyticalShape = {
   annual_ledgers: z
     .array(Ledger)
     .optional()
-    .describe('Complete-year ledgers delivered in this window; absent while collecting.'),
-  selections: z
-    .array(Selection)
-    .optional()
-    .describe('Version-selection decisions delivered in this window.'),
-  firms: z.array(Firm).optional().describe('Firm breakdowns delivered in this window.'),
-  issue_codes: z
-    .array(Issue)
-    .optional()
-    .describe('Overlapping issue breakdowns delivered in this window.'),
+    .describe('Complete-year ledgers in this window; absent while collecting.'),
+  selections: z.array(Selection).optional().describe('Version-selection decisions in this window.'),
+  firms: z.array(Firm).optional().describe('Firm breakdowns in this window.'),
+  issue_codes: z.array(Issue).optional().describe('Overlapping issue breakdowns in this window.'),
   targeted_entities: z
     .array(TargetedEntity)
     .optional()
-    .describe('Targeted entities delivered in this window.'),
+    .describe('Targeted entities in this window.'),
   selected_filings: z
     .array(FilingSchema)
     .optional()
-    .describe('Selected complete filings delivered in this window.'),
+    .describe('Complete selected filings in this window.'),
   raw_filings: z
     .array(FilingSchema)
     .optional()
-    .describe('Complete acquired filing versions delivered in this window.'),
+    .describe('All acquired versions in this window, including selected versions.'),
   activities: z
     .array(ActivityRowSchema)
     .optional()
-    .describe('Selected activities delivered in this window, without money columns.'),
+    .describe('Selected activities in this window; no money columns.'),
   dataset: DatasetSchema.optional().describe(
-    'Optional complete SQL staging with describe/query routing.',
+    'Complete SQL metadata on the first final window and its replay.',
   ),
   attribution_basis: z
     .literal('whole_filing_mentions_issue')
@@ -195,13 +202,17 @@ export const analyticalShape = {
     })
     .describe('Accounting limitations.'),
 };
-function rowSetOffsets(offset: number, metadata: Record<string, JsonValue> | undefined) {
+function rowSetOffsets(
+  offset: number,
+  metadata: Record<string, JsonValue> | undefined,
+  selected: Set<string>,
+) {
   if (!metadata) return {};
   const totals = RowSetCounts.parse(metadata.row_set_totals);
   let remaining = offset;
   const offsets: Record<string, number> = Object.create(null);
   for (const [name, total] of Object.entries(totals)) {
-    offsets[name] = Math.min(remaining, total);
+    offsets[name] = selected.has(name) ? Math.min(remaining, total) : 0;
     remaining -= offsets[name];
   }
   return { row_set_offsets: RowSetCounts.parse(offsets) };
@@ -238,6 +249,9 @@ function analyticalLists(records: JsonValue[]): Record<string, JsonValue[]> {
       case 'activity':
         append('activities', row.activity);
         break;
+      case 'notice':
+        append('notices', row.notice);
+        break;
       default: {
         const unreachable: never = row;
         throw new Error(`Unknown analytical row: ${unreachable}`);
@@ -254,6 +268,9 @@ export function analyzeScope(
   partitions: Record<string, string | number | boolean>[],
   build: (base: object) => object,
 ) {
+  const selected = new Set(
+    z.array(z.string()).parse(f.row_sets ?? Object.keys(RowSetCounts.shape)),
+  );
   const method = {
     selection_method: 'latest_posted_within_relationship_period',
     issue_buckets_overlap: true,
@@ -265,27 +282,47 @@ export function analyzeScope(
     scanKind: 'analysis',
     filters: f,
     ...(input.cursor ? { cursor: input.cursor } : {}),
-    maxPages: input.max_pages ?? 5,
+    maxPages: Math.min(input.max_pages ?? 5, 5),
     retainAll: true,
     source: source('filings', partitions),
-    provenance: provenance(f),
-    buildResponse: (w, meta, stored) =>
-      build({
-        ...envelope(
-          w,
-          f,
-          'No selected quarterly filings matched the completed scope; inspect uslobbying_list_reference topic issue_codes, or revise years/client/registrant.',
-          stored,
-        ),
+    provenance: provenance(f, input),
+    buildResponse: (w, meta, stored) => {
+      const { dataset: staged, ...metadata } = meta ?? {};
+      const dataset = staged === undefined ? undefined : DatasetSchema.parse(staged);
+      const lists = analyticalLists(w.records);
+      const base = envelope(
+        w,
+        f,
+        w.coverage.records_fetched === 0
+          ? 'No source filings were fetched for the completed scope; zero rows do not establish identifier validity.'
+          : meta && RowSetCounts.parse(meta.row_set_totals).selected_filings > 0
+            ? 'No rows belong to the selected inline row sets; inspect row_set_totals or request another selection.'
+            : 'Source filings were acquired, but no quarterly filings survived version and issue selection.',
+        stored,
+        input,
+      );
+      return build({
+        ...base,
         status: w.coverage.complete ? 'complete' : 'collecting',
         canvas_available: getCanvas() !== undefined,
-        ...analyticalLists(w.records),
+        ...lists,
+        notices: [...base.notices, ...(lists.notices ?? [])],
         attribution_basis: 'whole_filing_mentions_issue',
         methodology: method,
-        ...meta,
-        ...rowSetOffsets(w.offset, meta),
-      }),
-    async finalize({ chunks, coverage }) {
+        ...metadata,
+        ...(dataset
+          ? {
+              canvas_id: dataset.canvas_id,
+              describe_tool: dataset.describe_tool,
+              query_tool: dataset.query_tool,
+              guidance: dataset.guidance,
+              ...(w.offset === 0 ? { dataset } : {}),
+            }
+          : {}),
+        ...rowSetOffsets(w.offset, meta, selected),
+      });
+    },
+    async finalize({ chunks, coverage, checkpoint }) {
       async function* rawFilings() {
         for await (const chunk of chunks)
           for (const filing of chunk) yield FilingSchema.parse(filing);
@@ -309,21 +346,48 @@ export function analyzeScope(
           ctx,
         );
       async function* rows(): AsyncGenerator<JsonValue> {
-        for (const ledger of result.annual_ledgers)
-          yield JsonValueSchema.parse({ kind: 'annual_ledger', ledger });
-        for (const selection of result.selections)
-          yield JsonValueSchema.parse({ kind: 'selection', selection });
-        for (const firm of result.firms) yield JsonValueSchema.parse({ kind: 'firm', firm });
-        for (const issue of result.issue_codes)
-          yield JsonValueSchema.parse({ kind: 'issue', issue });
-        for (const entity of result.targeted_entities)
-          yield JsonValueSchema.parse({ kind: 'targeted_entity', ...entity });
-        for (const filing of result.selected)
-          yield JsonValueSchema.parse({ kind: 'selected_filing', filing });
-        for (const activity of result.activities)
-          yield JsonValueSchema.parse({ kind: 'activity', activity });
-        for await (const filing of rawFilings())
-          yield JsonValueSchema.parse({ kind: 'raw_filing', filing });
+        if (selected.has('annual_ledgers'))
+          for (const ledger of result.annual_ledgers)
+            yield JsonValueSchema.parse({ kind: 'annual_ledger', ledger });
+        if (selected.has('selections'))
+          for (const selection of result.selections)
+            yield JsonValueSchema.parse({ kind: 'selection', selection });
+        if (selected.has('firms'))
+          for (const firm of result.firms) yield JsonValueSchema.parse({ kind: 'firm', firm });
+        if (selected.has('issue_codes'))
+          for (const issue of result.issue_codes)
+            yield JsonValueSchema.parse({ kind: 'issue', issue });
+        if (selected.has('targeted_entities'))
+          for (const entity of result.targeted_entities)
+            yield JsonValueSchema.parse({ kind: 'targeted_entity', ...entity });
+        if (selected.has('selected_filings'))
+          for (const filing of result.selected)
+            yield JsonValueSchema.parse({ kind: 'selected_filing', filing });
+        if (selected.has('activities'))
+          for (const activity of result.activities)
+            yield JsonValueSchema.parse({ kind: 'activity', activity });
+        if (selected.has('raw_filings'))
+          for await (const filing of rawFilings())
+            yield JsonValueSchema.parse({ kind: 'raw_filing', filing });
+        // Notices use the same retained windows as records, so many empty partitions cannot inflate every response.
+        for (const [index, observed] of Object.entries(checkpoint.partitions?.observed ?? {})) {
+          const partition = partitions[Number(index)];
+          if (!observed.completeHistory || observed.recordsFetched !== 0 || !partition) continue;
+          const scope = Object.entries(partition)
+            .filter(([key]) => key !== 'page_size')
+            .map(([key, value]) => `${key}=${value}`)
+            .join(', ');
+          yield {
+            kind: 'notice',
+            notice: `No source filings were fetched for ${scope}; zero rows do not establish identifier validity.`,
+          };
+        }
+        if (coverage.records_fetched > 0 && result.selected.length === 0)
+          yield {
+            kind: 'notice',
+            notice:
+              'Source filings were acquired, but no quarterly filings survived version and issue selection.',
+          };
       }
       return {
         records: rows(),

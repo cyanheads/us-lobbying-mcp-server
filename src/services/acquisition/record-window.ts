@@ -86,16 +86,10 @@ function select(root: JsonValue, pointer: string): JsonValue {
     if (/~(?:[^01]|$)/.test(token)) throw badPath();
     const key = token.replaceAll('~1', '/').replaceAll('~0', '~');
     if (value === null || typeof value !== 'object' || !Object.hasOwn(value, key)) throw badPath();
-    if (Array.isArray(value)) {
-      if (!/^(?:0|[1-9]\d*)$/.test(key)) throw badPath();
-      const item = value[Number(key)];
-      if (item === undefined) throw badPath();
-      value = item;
-    } else {
-      const item = value[key];
-      if (item === undefined) throw badPath();
-      value = item;
-    }
+    if (Array.isArray(value) && !/^(?:0|[1-9]\d*)$/.test(key)) throw badPath();
+    const item = Array.isArray(value) ? value[Number(key)] : value[key];
+    if (item === undefined) throw badPath();
+    value = item;
   }
   return value;
 }

@@ -7,7 +7,11 @@ import { FULL_RESULT_TARGET_BYTES, QueryWindowSchema } from '../../src/domain/co
 import { fullResultBytes } from '../../src/domain/format.js';
 import { dataframeDescribeTool } from '../../src/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { dataframeQueryTool } from '../../src/mcp-server/tools/definitions/dataframe-query.tool.js';
-import { dropCanvasTable, queryCanvas } from '../../src/services/canvas/canvas-service.js';
+import {
+  dropCanvasTable,
+  queryCanvas,
+  setCanvas,
+} from '../../src/services/canvas/canvas-service.js';
 import { fixture, stage } from '../services/canvas/fixture.js';
 
 describe('dataframe contracts', () => {
@@ -262,7 +266,38 @@ describe('dataframe contracts', () => {
     expect(await f.instance.describe()).toEqual([]);
   });
 
-  it.each([{ row_limit: 101 }, { row_limit: 0 }, { offset: -1 }, { canvas_id: 'bad' }])(
+  it('clamps requested SQL rows with provider disclosure on both surfaces', async () => {
+    const result = await query({
+      canvas_id: f.instance.canvasId,
+      sql: `SELECT * FROM (VALUES ${Array.from({ length: 102 }, (_, n) => `(${n})`).join(',')}) t(i)`,
+      row_limit: 101,
+    });
+    const page = exact(result);
+    expect(page.rows).toHaveLength(100);
+    expect(page.delivery_limits).toEqual({ row_limit: { requested: 101, effective: 100 } });
+    setCanvas(f.canvas, 2);
+    const limitedResult = await query({
+      canvas_id: f.instance.canvasId,
+      result_table: page.result_table,
+      offset: 100,
+      row_limit: 200,
+    });
+    const limited = exact(limitedResult);
+    expect(limited.rows).toEqual([{ i: 100 }, { i: 101 }]);
+    expect(limited.delivery_limits).toEqual({ row_limit: { requested: 200, effective: 2 } });
+    expect(limitedResult.structuredContent).toMatchObject({ effective_row_limit: 2 });
+    const empty = exact(
+      await query({
+        canvas_id: f.instance.canvasId,
+        sql: 'SELECT 1 AS i WHERE false',
+        row_limit: 200,
+      }),
+    );
+    expect(empty.rows).toEqual([]);
+    expect(empty.delivery_limits).toEqual({ row_limit: { requested: 200, effective: 2 } });
+  });
+
+  it.each([{ row_limit: 0 }, { offset: -1 }, { canvas_id: 'bad' }])(
     'rejects invalid schema arguments %j',
     async (invalid) => {
       const result = await query({ canvas_id: f.instance.canvasId, sql: 'SELECT 1', ...invalid });

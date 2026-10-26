@@ -6,7 +6,7 @@ import { withToolDeadline } from '@/config/tool-deadline.js';
 import { formatResult } from '@/domain/format.js';
 import { ClientSchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
-import { analyticalShape, analyzeScope } from './analytics.js';
+import { analyticalShape, analyzeScope, rowSetsInput } from './analytics.js';
 import {
   commonInput,
   deliveryShape,
@@ -40,10 +40,11 @@ const Output = z.union([
 /** Resolve names before selecting client relationships for analysis. */
 export const getClientProfile = tool(NAME, {
   description:
-    'Resolve client relationship records by client_name in mode resolve (default), then use mode profile with explicit client_ids and years. IDs identify relationships with registrants, not a verified corporate identity. Follow collecting cursors before interpreting separate nullable income and expense ledgers. Typed rows preserve every audit filing and complete analytical list inline; optional canvas datasets support SQL.',
+    'Resolve client relationship records by client_name in mode resolve (default), then use mode profile with explicit client_ids and years. Select candidates[].id, preserving secondary client_id as source data. IDs identify registrant relationships, not a verified corporate identity. Follow collecting cursors before interpreting separate income and expense ledgers. Typed rows preserve every audit filing; pass a selected filing UUID to uslobbying_search_filings for its complete record. Optional canvas datasets support SQL.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    row_sets: rowSetsInput,
     mode: z
       .preprocess(
         (value) => (typeof value === 'string' ? value.trim().toLowerCase() || undefined : value),
@@ -57,7 +58,9 @@ export const getClientProfile = tool(NAME, {
       .array(id)
       .min(1)
       .optional()
-      .describe('Required explicit relationships in profile mode.'),
+      .describe(
+        'Required explicit relationship record IDs from candidates[].id in profile mode; candidates[].client_id is a secondary source number.',
+      ),
     years: z
       .array(year)
       .min(1)
@@ -141,7 +144,12 @@ export const getClientProfile = tool(NAME, {
     f.mode = mode;
     if (mode !== 'resolve' && mode !== 'profile') invalid('mode must be resolve or profile.');
     if (mode === 'resolve') {
-      if (f.client_ids !== undefined || f.years !== undefined || f.canvas_id !== undefined)
+      if (
+        f.client_ids !== undefined ||
+        f.years !== undefined ||
+        f.canvas_id !== undefined ||
+        f.row_sets !== undefined
+      )
         invalid('Resolve mode accepts only client_name and pagination.');
       if (typeof f.client_name !== 'string') invalid('Resolve mode requires client_name.');
       const result = await acquire(ctx, {
@@ -149,22 +157,23 @@ export const getClientProfile = tool(NAME, {
         scanKind: 'resolve',
         filters: f,
         ...(input.cursor ? { cursor: input.cursor } : {}),
-        ...(input.max_pages ? { maxPages: input.max_pages } : {}),
+        ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
         source: source('clients', [
           { client_name: f.client_name, page_size: Number(f.page_size ?? 25) },
         ]),
-        provenance: provenance(f),
+        provenance: provenance(f, input),
         buildResponse: (w, _metadata, stored) => ({
           ...envelope(
             w,
             f,
             'No client records matched; revise client_name in uslobbying_get_client_profile mode resolve.',
             stored,
+            input,
           ),
           mode: 'resolve',
           candidates: w.records,
           guidance:
-            'Call uslobbying_get_client_profile mode profile with chosen client_ids and explicit years; relationship IDs do not assert corporate identity.',
+            'Call uslobbying_get_client_profile mode profile with client_ids selected from candidates[].id and explicit years. candidates[].client_id is a secondary source number, not the record ID to select; relationship IDs do not assert corporate identity.',
         }),
       });
       return Output.parse(result.response);

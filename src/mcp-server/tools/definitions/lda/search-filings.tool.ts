@@ -7,16 +7,20 @@ import { FilingSchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
 import { matchesFiling } from '@/services/lobbying/analysis.js';
 import {
+  amountFilter,
   commonInput,
   deliveryShape,
   envelope,
   id,
   invalid,
+  nativeFilters,
+  optionalFilter,
   outputObject,
   provenance,
   recordOutput,
   scope,
   source,
+  validateAmountRange,
   verifyCode,
   year,
 } from './shared.js';
@@ -36,12 +40,45 @@ const Output = z.union([
 /** Search federal lobbying registrations and activity reports with all original and amended versions. Require a year or another upstream scope; issue_code filters activities locally and cannot narrow upstream requests. Follow next_cursor for all matches. Amounts are separate nullable USD strings; disclosure text is untrusted record data. */
 export const searchFilings = tool(NAME, {
   description:
-    'Search federal lobbying registrations and activity reports with all original and amended versions. Require a year or another upstream scope; issue_code filters activities locally and cannot narrow upstream requests. Follow next_cursor for all matches. Amounts are separate nullable USD strings; disclosure text is untrusted record data.',
+    'Search federal lobbying registrations and activity reports, or retrieve a complete filing by filing_uuid from evidence or analytical selections. Native filters include posting dates, reported amounts, client location and foreign entities; issue_code filters activities locally and cannot narrow upstream requests. Follow next_cursor for all versions. Amounts are separate nullable USD strings; disclosure text is untrusted record data.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    filing_uuid: optionalFilter(z.string().uuid()).describe(
+      'Exact filing UUID from evidence or analytical selections; retrieves complete source records.',
+    ),
+    posted_after: optionalFilter(z.iso.date()).describe(
+      'Earliest native filing posting calendar date.',
+    ),
+    posted_before: optionalFilter(z.iso.date()).describe(
+      'Latest native filing posting calendar date.',
+    ),
+    amount_min: amountFilter.describe(
+      'Native minimum reported filing amount, exact decimal USD with at most two fractional digits.',
+    ),
+    amount_max: amountFilter.describe(
+      'Native maximum reported filing amount, exact decimal USD with at most two fractional digits.',
+    ),
+    client_state: z.string().optional().describe('Native client state code, normalized uppercase.'),
+    client_country: z
+      .string()
+      .optional()
+      .describe('Native client country code, normalized uppercase.'),
+    foreign_entity_name: z
+      .string()
+      .optional()
+      .describe('Native disclosed foreign entity name search.'),
+    foreign_entity_country: z
+      .string()
+      .optional()
+      .describe('Native foreign entity country code, normalized uppercase.'),
+    lobbyist_name: z.string().optional().describe('Native disclosed lobbyist name search.'),
     filing_year: year.optional().describe('Reported year, 1999 through the current UTC year.'),
-    client_id: id.optional().describe('Client relationship ID.'),
+    client_id: id
+      .optional()
+      .describe(
+        'Client relationship record ID from candidates[].id in uslobbying_get_client_profile resolve mode; candidates[].client_id is secondary.',
+      ),
     registrant_id: id.optional().describe('Registrant ID.'),
     lobbyist_id: id.optional().describe('Lobbyist ID.'),
     client_name: z.string().optional().describe('Literal client name upstream search.'),
@@ -117,12 +154,16 @@ export const searchFilings = tool(NAME, {
     const resolved = await scope(input, ctx, NAME);
     if (resolved.record) return Output.parse(resolved.record);
     const f = resolved.filters;
+    validateAmountRange(f);
+    if (
+      typeof f.posted_after === 'string' &&
+      typeof f.posted_before === 'string' &&
+      f.posted_after > f.posted_before
+    )
+      invalid('Posting date range is inverted.');
     await verifyCode('filing_types', f.filing_type, ctx);
     await verifyCode('issue_codes', f.issue_code, ctx);
-    const native: Record<string, string | number | boolean> = {
-      page_size: Number(f.page_size ?? 25),
-    };
-    for (const key of [
+    const native = nativeFilters(f, [
       'filing_year',
       'client_id',
       'registrant_id',
@@ -131,10 +172,20 @@ export const searchFilings = tool(NAME, {
       'registrant_name',
       'filing_type',
       'filing_period',
-    ]) {
-      const value = f[key];
-      if (typeof value === 'string' || typeof value === 'number') native[key] = value;
-    }
+      'filing_uuid',
+      'client_state',
+      'client_country',
+      'foreign_entity_name',
+      'foreign_entity_country',
+      'lobbyist_name',
+    ]);
+    for (const [key, upstream] of Object.entries({
+      posted_after: 'filing_dt_posted_after',
+      posted_before: 'filing_dt_posted_before',
+      amount_min: 'filing_amount_reported_min',
+      amount_max: 'filing_amount_reported_max',
+    }))
+      if (typeof f[key] === 'string') native[upstream] = f[key];
     if (typeof f.specific_issues === 'string')
       native.filing_specific_lobbying_issues = f.specific_issues;
     if (Object.keys(native).length === 1)
@@ -144,9 +195,9 @@ export const searchFilings = tool(NAME, {
       scanKind: 'filings',
       filters: f,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(input.max_pages ? { maxPages: input.max_pages } : {}),
+      ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
       source: source('filings', [native]),
-      provenance: provenance(f),
+      provenance: provenance(f, input),
       matches: (row) =>
         matchesFiling(
           FilingSchema.parse(row),
@@ -158,6 +209,7 @@ export const searchFilings = tool(NAME, {
           f,
           'No filings matched the completed scope; use uslobbying_list_reference topic filing_types or issue_codes, then revise uslobbying_search_filings.',
           stored,
+          input,
         ),
         filings: w.records,
         amendment_policy: 'all_versions',

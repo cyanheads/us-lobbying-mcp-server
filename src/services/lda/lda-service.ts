@@ -112,6 +112,18 @@ const allowed = {
 } as const;
 /** Endpoint names constrain both filters and continuation paths. */
 export type LdaNoun = keyof typeof allowed;
+function isAllowed(noun: LdaNoun, key: string): boolean {
+  return (allowed[noun] as readonly string[]).includes(key);
+}
+/** Statuses outside this map classify as ServiceUnavailable (5xx) or ValidationError. */
+const STATUS_CODES = new Map<number, JsonRpcErrorCode>([
+  [401, JsonRpcErrorCode.Unauthorized],
+  [403, JsonRpcErrorCode.Forbidden],
+  [404, JsonRpcErrorCode.NotFound],
+  [408, JsonRpcErrorCode.Timeout],
+  [429, JsonRpcErrorCode.RateLimited],
+]);
+const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 /** Only official endpoint parameters are representable. Runtime validation also rejects unknown keys. */
 export type LdaFilters<N extends LdaNoun> = Partial<
   Record<(typeof allowed)[N][number], string | number | boolean>
@@ -175,7 +187,7 @@ export class LdaService {
   private url<N extends LdaNoun>(noun: N, filters: LdaFilters<N>): URL {
     const url = new URL(`${noun}/`, BASE);
     for (const [key, value] of Object.entries(filters)) {
-      if (!(allowed[noun] as readonly string[]).includes(key))
+      if (!isAllowed(noun, key))
         throw validationError('Unsupported LDA endpoint filter.', {
           reason: 'invalid_filter',
           parameter: key,
@@ -223,11 +235,7 @@ export class LdaService {
     )
       throw invalid();
     for (const key of link.searchParams.keys())
-      if (
-        !(allowed[noun] as readonly string[]).includes(key) ||
-        link.searchParams.getAll(key).length !== 1
-      )
-        throw invalid();
+      if (!isAllowed(noun, key) || link.searchParams.getAll(key).length !== 1) throw invalid();
     const page = link.searchParams.get('page');
     if (!page || !/^\d+$/.test(page) || Number(page) !== currentPage + 1) throw invalid();
     expected.searchParams.delete('page');
@@ -266,27 +274,17 @@ export class LdaService {
               });
               if (!response.ok) {
                 await response.body?.cancel();
-                const retryable = [408, 429, 500, 502, 503, 504].includes(response.status);
+                const { status } = response;
                 const code =
-                  response.status === 429
-                    ? JsonRpcErrorCode.RateLimited
-                    : response.status === 404
-                      ? JsonRpcErrorCode.NotFound
-                      : response.status === 401
-                        ? JsonRpcErrorCode.Unauthorized
-                        : response.status === 403
-                          ? JsonRpcErrorCode.Forbidden
-                          : response.status === 408
-                            ? JsonRpcErrorCode.Timeout
-                            : response.status >= 500
-                              ? JsonRpcErrorCode.ServiceUnavailable
-                              : JsonRpcErrorCode.ValidationError;
+                  STATUS_CODES.get(status) ??
+                  (status >= 500
+                    ? JsonRpcErrorCode.ServiceUnavailable
+                    : JsonRpcErrorCode.ValidationError);
+                const retryAfter = response.headers.get('retry-after');
                 throw new McpError(code, 'The official LDA request failed.', {
-                  status: response.status,
-                  retryable,
-                  ...(response.headers.get('retry-after')
-                    ? { retryAfter: response.headers.get('retry-after') }
-                    : {}),
+                  status,
+                  retryable: RETRYABLE_STATUSES.has(status),
+                  ...(retryAfter ? { retryAfter } : {}),
                 });
               }
               body = await response.text();
@@ -410,14 +408,16 @@ export class LdaService {
   }
 }
 let service: LdaService | undefined;
+function configuredOptions(): LdaServiceOptions {
+  const apiKey = getServerConfig().ldaApiKey;
+  return apiKey ? { apiKey } : {};
+}
 /** Initialize once in application setup; transport injection is available to verification. */
 export function initLdaService(options?: LdaServiceOptions): void {
-  const apiKey = getServerConfig().ldaApiKey;
-  service = new LdaService(options ?? (apiKey ? { apiKey } : {}));
+  service = new LdaService(options ?? configuredOptions());
 }
 /** Lazily provide the configured source service for tools. */
 export function getLdaService(): LdaService {
-  const apiKey = getServerConfig().ldaApiKey;
-  service ??= new LdaService(apiKey ? { apiKey } : {});
+  service ??= new LdaService(configuredOptions());
   return service;
 }

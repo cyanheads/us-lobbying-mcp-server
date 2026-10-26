@@ -54,16 +54,18 @@ export async function exclusive<T>(ctx: Context, id: string, run: () => Promise<
 /** Read JSON through the framework facade, preserving cancellation and explicit invalidation. */
 export async function readJson(ctx: Context, key: string): Promise<JsonValue> {
   ctx.signal.throwIfAborted();
+  let value: unknown;
   try {
-    const value = await ctx.state.get(key);
-    if (value === null) throw invalidCursor();
-    const parsed = JsonValueSchema.safeParse(value);
-    if (!parsed.success) throw invalidCursor();
-    return parsed.data;
+    value = await ctx.state.get(key);
   } catch (error) {
     ctx.signal.throwIfAborted();
     throw invalidCursorWithCause(error);
   }
+  ctx.signal.throwIfAborted();
+  if (value === null) throw invalidCursor();
+  const parsed = JsonValueSchema.safeParse(value);
+  if (!parsed.success) throw invalidCursorWithCause(parsed.error);
+  return parsed.data;
 }
 function invalidCursorWithCause(cause: unknown) {
   return validationError(

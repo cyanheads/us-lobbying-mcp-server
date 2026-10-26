@@ -1,13 +1,13 @@
 /** @fileoverview Sparse LDA wire contracts retaining every unknown JSON field once. @module domain/lda */
 import { z } from '@cyanheads/mcp-ts-core';
-import { IdSchema, JsonValueSchema, normalizeSourceId, SourceIdSchema } from './json.js';
+import { IdSchema, JsonValueSchema, normalizeSourceId } from './json.js';
 
 const text = z.string().nullable().optional();
 /** Disclosed government entity identifiers are normalized like other source identities. */
 export const GovernmentEntitySchema = z
   .object({
-    id: IdSchema.optional().describe('Official government entity identifier when supplied.'),
-    name: text.describe('Source entity name when supplied.'),
+    id: IdSchema.optional().describe('Official entity ID.'),
+    name: text.describe('Source entity name.'),
   })
   .catchall(JsonValueSchema)
   .describe('Disclosed government entity.');
@@ -23,13 +23,19 @@ export const RegistrantSchema = z
     house_registrant_id: IdSchema.nullable().optional().describe('House identifier when supplied.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Registrant relationship identity and disclosed fields.')
+  .describe('Registrant relationship and disclosures.')
   .meta({ id: 'LdaRegistrant' });
 /** Client IDs identify a registrant relationship, not a merged corporate entity. */
 export const ClientSchema = z
   .object({
-    id: IdSchema.describe('Client relationship identifier.'),
-    client_id: IdSchema.nullable().optional().describe('Source secondary client identifier.'),
+    id: IdSchema.describe(
+      'Client relationship record ID; select candidates[].id for client_id or client_ids inputs.',
+    ),
+    client_id: IdSchema.nullable()
+      .optional()
+      .describe(
+        'Source secondary client number; do not select candidates[].client_id for client filters.',
+      ),
     name: z.string().describe('Literal client name.'),
     general_description: text.describe('Reported client description.'),
     effective_date: text.describe('Source effective date.'),
@@ -38,7 +44,7 @@ export const ClientSchema = z
     registrant: RegistrantSchema.optional().describe('Registrant embedded by client search.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Client relationship and its complete source fields.')
+  .describe('Complete client relationship.')
   .meta({ id: 'LdaClient' });
 /** Lobbyist identity; covered positions belong to filing activity membership instead. */
 export const LobbyistSchema = z
@@ -56,7 +62,7 @@ export const LobbyistSchema = z
 export const ActivityLobbyistSchema = z
   .object({
     lobbyist: LobbyistSchema.omit({ registrant: true }).describe(
-      'Identity embedded in a filing; the parent filing supplies its registrant. Additional source fields remain intact.',
+      'Filing identity; registrant comes from the parent. All source fields are retained.',
     ),
     covered_position: text.describe('Reported covered-position text, not verified employment.'),
     new: z.boolean().nullable().optional().describe('Source new-lobbyist flag.'),
@@ -70,14 +76,11 @@ export const LobbyingActivitySchema = z
     general_issue_code: z.string().describe('Official general issue code.'),
     description: text.describe('Complete specific-issues description.'),
     foreign_entity_issues: text.describe('Disclosed foreign issues.'),
-    lobbyists: z
-      .array(ActivityLobbyistSchema)
-      .optional()
-      .describe('Complete disclosed participant list.'),
+    lobbyists: z.array(ActivityLobbyistSchema).optional().describe('All disclosed participants.'),
     government_entities: z
       .array(GovernmentEntitySchema)
       .optional()
-      .describe('Complete targeted government entities.'),
+      .describe('All targeted government entities.'),
   })
   .catchall(JsonValueSchema)
   .describe('Complete reported lobbying activity.')
@@ -88,7 +91,7 @@ export const ActivityRowSchema = LobbyingActivitySchema.extend({
   activity_index: z.number().int().describe('Original activity index.'),
   client_id: z.string().describe('Client relationship ID.'),
   registrant_id: z.string().describe('Registrant ID.'),
-}).describe('Complete selected activity with parent relationship identifiers.');
+}).describe('Selected activity and parent relationship IDs.');
 /** One derived activity row with a stable parent and array position. */
 export type ActivityRow = z.infer<typeof ActivityRowSchema>;
 /** Decimal USD source amounts; null means unknown, distinct from explicit zero. */
@@ -105,7 +108,7 @@ const filingFields = {
   dt_posted: z.iso
     .datetime({ offset: true })
     .describe('Source posting timestamp used in analytical selection.'),
-  filing_document_url: text.describe('Official returned filing-document URL.'),
+  filing_document_url: text.describe('Official filing-document URL.'),
   filing_document_content_type: text.describe('Source document media type.'),
   registrant: RegistrantSchema.nullable().optional().describe('Reported registrant.'),
 };
@@ -129,7 +132,7 @@ export const FilingSchema = z
     affiliated_organizations: z.array(JsonValueSchema).optional().describe('Complete affiliates.'),
   })
   .catchall(JsonValueSchema)
-  .describe('Complete source filing, including unknown disclosures.')
+  .describe('Complete filing and unknown disclosures.')
   .meta({ id: 'LdaFiling' });
 /** Contribution child retains membership and repeated identical items. */
 export const ContributionItemSchema = z
@@ -198,28 +201,26 @@ export const LdaConstantSchema = z
     name: z.string().describe('Official constant label.'),
   })
   .catchall(JsonValueSchema);
+const ID_KEYS = new Set(['id', 'client_id', 'house_registrant_id']);
+const NESTED_KEYS = new Set([
+  'results',
+  'registrant',
+  'client',
+  'lobbyist',
+  'lobbyists',
+  'lobbying_activities',
+  'government_entities',
+  'conviction_disclosures',
+]);
 /** Normalize only verified identity-bearing source objects, preserving all unknown fields once. */
 export function normalizeLdaRecord(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalizeLdaRecord);
   if (value === null || typeof value !== 'object') return value;
   const result: Record<string, unknown> = Object.create(null);
   for (const [key, child] of Object.entries(value)) {
-    if (['id', 'client_id', 'house_registrant_id'].includes(key) && child !== null) {
-      result[key] = normalizeSourceId(SourceIdSchema.parse(child));
-    } else if (
-      [
-        'results',
-        'registrant',
-        'client',
-        'lobbyist',
-        'lobbyists',
-        'lobbying_activities',
-        'government_entities',
-        'conviction_disclosures',
-      ].includes(key)
-    ) {
-      result[key] = normalizeLdaRecord(child);
-    } else result[key] = child;
+    if (ID_KEYS.has(key) && child !== null) result[key] = normalizeSourceId(child);
+    else if (NESTED_KEYS.has(key)) result[key] = normalizeLdaRecord(child);
+    else result[key] = child;
   }
   return result;
 }

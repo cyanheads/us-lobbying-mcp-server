@@ -14,6 +14,10 @@ function decode(text: string): unknown {
 }
 
 describe('formatResult', () => {
+  it('serializes the complete JSON twin compactly', () => {
+    const value = { nested: [{ unicode: 'é🌲', text: '```' }], empty: [] };
+    expect(formatResult(value)[0]?.text).toBe(`\`\`\`\`json\n${JSON.stringify(value)}\n\`\`\`\``);
+  });
   it('preserves nested unknown fields, nulls, CRLF, multibyte text and hostile instructions', () => {
     const result = {
       records: [
@@ -112,7 +116,7 @@ describe('fullResultBytes', () => {
       records: [{ name: '漢字🌲\r\n', document: 'https://efile.fara.gov/docs/a.pdf' }],
       count: 1,
     };
-    const json = JSON.stringify(result, null, 2);
+    const json = JSON.stringify(result);
     const expectedContent = [
       {
         type: 'text',

@@ -86,6 +86,95 @@ async function failure(
 }
 
 describe('FARA tool invocation', () => {
+  it('clamps FARA windows before normalized cursor comparison and record selectors', async () => {
+    install(() =>
+      snapshotResponse(
+        'registrants',
+        Array.from({ length: 30 }, (_, n) => registrant(String(n + 1), 'Synthetic')).join(''),
+      ),
+    );
+    const ctx = context();
+    const first = await invoke({ page_size: 26, record_limit: 26 }, ctx);
+    expect(first.output.delivery_limits).toEqual({
+      page_size: { requested: 26, effective: 25 },
+      record_limit: { requested: 26, effective: 25 },
+    });
+    expect(first.output.effective_filters.page_size).toBe(25);
+    const second = await invoke({ cursor: first.output.next_cursor!, page_size: 99 }, ctx);
+    expect((first.output.records?.length ?? 0) + (second.output.records?.length ?? 0)).toBe(30);
+    expect(second.output.delivery_limits).toEqual({ page_size: { requested: 99, effective: 25 } });
+    expect(
+      (await invoke({ cursor: first.output.next_cursor!, page_size: 100 }, ctx)).output,
+    ).toEqual(second.output);
+    await expect(
+      invoke({ cursor: first.output.next_cursor!, page_size: 24 }, ctx),
+    ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
+  });
+  it('delivers every redirected document through pinned windows with equal response surfaces', async () => {
+    const target =
+      'https://efile.fara.gov/CallAPI/GetJSON?a=f?p=API:REGISTRANTDOCS-F_XML:::::F_XML_REG_NUM,F_XML_CC,F_XML_DOC_TYPE:5931,,';
+    const rows = Array.from({ length: 145 }, (_, index) => ({
+      REGISTRATION_NUMBER: 5931,
+      DATE_STAMPED: '2026-08-27T00:00:00',
+      DOCUMENT_TYPE: 'Amendment',
+      URL: `https://efile.fara.gov/docs/5931-Amendment-${index}.pdf`,
+      SHORT_FORM_NAME: '',
+      FOREIGN_PRINCIPAL_NAME: '',
+      FOREIGN_PRINCIPAL_COUNTRY: '',
+      REGISTRANT_NAME: 'Synthetic firm',
+      future: { index, values: [null, false, 0] },
+    }));
+    const calls = install((url) =>
+      url.pathname.startsWith('/api/')
+        ? new Response(null, { status: 302, headers: { Location: target } })
+        : new Response(latin1(JSON.stringify({ ROWSET: { ROW: rows } }))),
+    );
+    const ctx = context();
+    let page = await invoke(
+      { mode: 'detail', detail: 'documents', registration_number: '5931', page_size: 5 },
+      ctx,
+    );
+    const delivered = [];
+    for (;;) {
+      expect(page.output.source_urls).toEqual([
+        'https://efile.fara.gov/api/v1/RegDocs/json/5931',
+        target,
+      ]);
+      expect(page.output.total_matches).toBe(145);
+      delivered.push(...(page.output.records ?? []));
+      if (!page.output.next_cursor) break;
+      page = await invoke({ cursor: page.output.next_cursor }, ctx);
+    }
+    expect(delivered.map((row) => row.raw)).toEqual(rows);
+    expect(delivered.map((row) => row.document_url)).toEqual(rows.map((row) => row.URL));
+    expect(calls).toEqual(['/api/v1/RegDocs/json/5931', '/CallAPI/GetJSON']);
+  });
+  it('renders unsupported redirect recovery and the nonretryable reason on both error surfaces', async () => {
+    const calls = install(
+      () =>
+        new Response(null, {
+          status: 302,
+          headers: { Location: 'https://outside.example/documents' },
+        }),
+    );
+    const response = await settle(
+      runToolContract(definition.searchForeignAgentsTool, {
+        mode: 'detail',
+        detail: 'documents',
+        registration_number: '5931',
+      }),
+    );
+    expect(response.structuredContent).toMatchObject({
+      error: { data: { reason: 'source_schema_changed', retryable: false } },
+    });
+    const text = response.content
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(text).toContain('source_schema_changed');
+    expect(text).toContain('redirect route is supported');
+    expect(calls).toHaveLength(1);
+  });
   it('filters all rows before local page_size, pins provenance, replays and completes without refetch', async () => {
     let revision = 'Original';
     const calls = install(() =>
@@ -248,7 +337,7 @@ describe('FARA tool invocation', () => {
   });
   it.each([
     { page_size: 0 },
-    { page_size: 26 },
+    { page_size: 1.5 },
     { page_size: '' },
     { mode: 'invalid' },
     { registration_number: '../1' },
@@ -286,7 +375,7 @@ describe('FARA tool invocation', () => {
     const first = await invoke({ page_size: 1 }, ctx);
     await expect(
       invoke({ cursor: first.output.next_cursor, page_size: 2 }, ctx),
-    ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
+    ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
     const foreign = await settle(
       runToolContract(
         definition.searchForeignAgentsTool,
@@ -375,24 +464,27 @@ describe('FARA deferred parent retrieval', () => {
         })),
       },
     };
-    const calls = install(
-      () =>
-        new Response(
-          latin1(
-            JSON.stringify({
-              ROWSET: {
-                ROW: [
-                  raw,
-                  {
-                    REGISTRATION_NUMBER: 2,
-                    DOCUMENT_TYPE: 'Second',
-                    URL: 'https://efile.fara.gov/docs/second.pdf',
-                  },
-                ],
-              },
-            }),
+    const target =
+      'https://efile.fara.gov/CallAPI/GetJSON?a=f?p=API:REGISTRANTDOCS-F_XML:::::F_XML_REG_NUM,F_XML_CC,F_XML_DOC_TYPE:0001,,';
+    const calls = install((url) =>
+      url.pathname.startsWith('/api/')
+        ? new Response(null, { status: 302, headers: { Location: target } })
+        : new Response(
+            latin1(
+              JSON.stringify({
+                ROWSET: {
+                  ROW: [
+                    raw,
+                    {
+                      REGISTRATION_NUMBER: 2,
+                      DOCUMENT_TYPE: 'Second',
+                      URL: 'https://efile.fara.gov/docs/second.pdf',
+                    },
+                  ],
+                },
+              }),
+            ),
           ),
-        ),
     );
     const ctx = context();
     const first = await invoke(
@@ -400,6 +492,10 @@ describe('FARA deferred parent retrieval', () => {
       ctx,
     );
     expect(first.output.records_deferred).toBe(1);
+    expect(first.output.source_urls).toEqual([
+      'https://efile.fara.gov/api/v1/RegDocs/json/0001',
+      target,
+    ]);
     expect(first.output.records_returned).toBe(0);
     const handle = first.output.record_handles?.[0]?.record_handle;
     expect(handle).toBeTypeOf('string');
@@ -413,9 +509,12 @@ describe('FARA deferred parent retrieval', () => {
       let container: JsonValue[] | Record<string, JsonValue> | undefined;
       for (;;) {
         const response = await invoke(
-          { record_handle: handle, record_path: path, record_offset: offset },
+          { record_handle: handle, record_path: path, record_offset: offset, record_limit: 26 },
           ctx,
         );
+        expect(response.output.delivery_limits).toEqual({
+          record_limit: { requested: 26, effective: 25 },
+        });
         const window = response.output.record_window;
         if (!window) throw new Error('Missing retained window');
         if (window.kind === 'scalar') return window.value ?? null;
@@ -449,6 +548,6 @@ describe('FARA deferred parent retrieval', () => {
         ctx,
       ),
     ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
   });
 });

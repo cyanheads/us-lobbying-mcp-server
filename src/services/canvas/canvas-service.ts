@@ -101,19 +101,26 @@ function missing(name: string): McpError {
   });
 }
 
+const POLICY_REASONS = new Set([
+  'non_select_statement',
+  'multi_statement',
+  'denied_function',
+  'sql_read_only',
+  'plan_operator_not_allowed',
+]);
+/** Engine details can echo arbitrary SQL literals or host paths. Retain diagnostics on cause. */
+const ENGINE_REASONS = new Set([
+  'invalid_sql',
+  'sql_execution_error',
+  'sql_parse_error',
+  'sql_read_only',
+  'database_error',
+]);
+
 function route(error: unknown, dropping: boolean): never {
   if (!(error instanceof McpError)) throw error;
   const reason = error.data?.reason;
-  if (
-    typeof reason === 'string' &&
-    [
-      'non_select_statement',
-      'multi_statement',
-      'denied_function',
-      'sql_read_only',
-      'plan_operator_not_allowed',
-    ].includes(reason)
-  )
+  if (typeof reason === 'string' && POLICY_REASONS.has(reason))
     throw new McpError(
       error.code,
       'Only one read-only SELECT over staged tables is allowed.',
@@ -139,17 +146,9 @@ function route(error: unknown, dropping: boolean): never {
       },
       { cause: error },
     );
-  /** Engine details can echo arbitrary SQL literals or host paths. Retain diagnostics on cause. */
-  const engineReasons = new Set([
-    'invalid_sql',
-    'sql_execution_error',
-    'sql_parse_error',
-    'sql_read_only',
-    'database_error',
-  ]);
   if (
     error.code === JsonRpcErrorCode.DatabaseError ||
-    (typeof reason === 'string' && engineReasons.has(reason))
+    (typeof reason === 'string' && ENGINE_REASONS.has(reason))
   ) {
     const { binderMessage: _binder, engineMessage: _engine, ...data } = error.data ?? {};
     throw new McpError(
@@ -175,12 +174,10 @@ async function operate<T>(
   run: (instance: CanvasInstance) => Promise<T>,
   dropping = false,
 ): Promise<T> {
-  ctx.signal?.throwIfAborted();
+  ctx.signal.throwIfAborted();
   let lock: string | undefined;
   try {
-    const instance = await requireCanvas().acquire(canvasId, ctx, {
-      ...(ctx.signal && { signal: ctx.signal }),
-    });
+    const instance = await requireCanvas().acquire(canvasId, ctx, { signal: ctx.signal });
     lock = JSON.stringify([instance.tenantId, instance.canvasId]);
     if (admitted.has(lock)) {
       lock = undefined;
@@ -192,7 +189,7 @@ async function operate<T>(
     admitted.add(lock);
     return await run(instance);
   } catch (error) {
-    if (ctx.signal?.aborted) throw ctx.signal.reason;
+    if (ctx.signal.aborted) throw ctx.signal.reason;
     return route(error, dropping);
   } finally {
     if (lock !== undefined) admitted.delete(lock);
@@ -298,7 +295,7 @@ export async function stageFilings(input: StageFilingsInput, ctx: Context): Prom
     const attempted: string[] = [];
     try {
       for (const registration of registrations) {
-        ctx.signal?.throwIfAborted();
+        ctx.signal.throwIfAborted();
         let name = fresh(registration.prefix);
         while (existing.has(name)) name = fresh(registration.prefix);
         existing.add(name);
@@ -306,7 +303,7 @@ export async function stageFilings(input: StageFilingsInput, ctx: Context): Prom
         const created_at = new Date().toISOString();
         await instance.registerTable(name, registration.rows, {
           schema: registration.schema,
-          ...(ctx.signal && { signal: ctx.signal }),
+          signal: ctx.signal,
         });
         await ctx.state.set(
           key(instance, name),
@@ -320,13 +317,13 @@ export async function stageFilings(input: StageFilingsInput, ctx: Context): Prom
           { ttl: Math.ceil(config.canvas.absoluteCapMs / 1000) },
         );
       }
-      ctx.signal?.throwIfAborted();
+      ctx.signal.throwIfAborted();
       return await dataset(instance, attempted, ctx);
     } catch (error) {
       try {
         await cleanup(instance, attempted, ctx);
       } catch (cleanupError) {
-        if (ctx.signal?.aborted) throw ctx.signal.reason;
+        if (ctx.signal.aborted) throw ctx.signal.reason;
         throw new AggregateError(
           [error, cleanupError],
           'Canvas staging failed and cleanup was incomplete.',
@@ -343,7 +340,7 @@ export async function describeCanvas(
   ctx: Context,
 ) {
   return await operate(input.canvas_id, ctx, async (instance) => {
-    ctx.signal?.throwIfAborted();
+    ctx.signal.throwIfAborted();
     const tables = await instance.describe(
       input.table_name === undefined ? undefined : { tableName: input.table_name },
     );
@@ -358,7 +355,7 @@ export async function describeCanvas(
       if (fullResultBytes({ ...routing, tables: metadata }) > FULL_RESULT_TARGET_BYTES)
         throw oversized(instance, table.name);
     }
-    ctx.signal?.throwIfAborted();
+    ctx.signal.throwIfAborted();
     return {
       ...routing,
       tables: metadata,
@@ -386,11 +383,11 @@ function oversized(instance: CanvasInstance, name: string): McpError {
 /** Materialize complete SELECT results, then deliver whole rows within the complete wire budget. */
 export async function queryCanvas(input: CanvasQueryInput, ctx: Context) {
   const requested = input.row_limit ?? 25;
-  if (!Number.isSafeInteger(requested) || requested < 1 || requested > 100)
-    throw validationError('row_limit must be an integer from 1 through 100.', {
+  if (!Number.isFinite(requested) || !Number.isInteger(requested) || requested < 1)
+    throw validationError('row_limit must be a positive integer.', {
       reason: 'invalid_filter',
     });
-  const rowLimit = Math.min(requested, configuredRowLimit ?? config.canvas.defaultRowLimit);
+  const rowLimit = Math.min(requested, 100, configuredRowLimit ?? config.canvas.defaultRowLimit);
   return await operate(input.canvas_id, ctx, async (instance) => {
     let name: string;
     let offset: number;
@@ -401,7 +398,7 @@ export async function queryCanvas(input: CanvasQueryInput, ctx: Context) {
         registerAs: name,
         preview: 0,
         rowLimit,
-        ...(ctx.signal && { signal: ctx.signal }),
+        signal: ctx.signal,
       });
       try {
         await ctx.state.set(
@@ -439,7 +436,7 @@ export async function queryCanvas(input: CanvasQueryInput, ctx: Context) {
         try {
           await cleanup(instance, [name], ctx);
         } catch (cleanupError) {
-          if (ctx.signal?.aborted) throw ctx.signal.reason;
+          if (ctx.signal.aborted) throw ctx.signal.reason;
           throw new AggregateError(
             [error, cleanupError],
             'Canvas query failed and cleanup was incomplete.',
@@ -461,7 +458,7 @@ async function queryWindow(
 ) {
   const result = await instance.query(
     `SELECT * FROM ${quoteIdentifier(name)} ORDER BY ALL LIMIT ${rowLimit} OFFSET ${offset}`,
-    { rowLimit, ...(ctx.signal && { signal: ctx.signal }) },
+    { rowLimit, signal: ctx.signal },
   );
   const staged = await dataset(instance, [name], ctx);
   const table = staged.tables[0];
@@ -487,6 +484,9 @@ async function queryWindow(
     truncated: offset + delivered.length < table.row_count,
     row_order: 'canonical_values' as const,
     ...(rowLimit < requested && { effective_row_limit: rowLimit }),
+    ...(rowLimit < requested && {
+      delivery_limits: { row_limit: { requested, effective: rowLimit } },
+    }),
   });
   const delivered: typeof rows = [];
   if (fullResultBytes(output(delivered)) > FULL_RESULT_TARGET_BYTES)
@@ -499,7 +499,7 @@ async function queryWindow(
       break;
     }
   }
-  ctx.signal?.throwIfAborted();
+  ctx.signal.throwIfAborted();
   return {
     ...QueryWindowSchema.parse(output(delivered)),
     ...(rowLimit < requested && { effective_row_limit: rowLimit }),
@@ -515,7 +515,7 @@ export async function dropCanvasTable(
     input.canvas_id,
     ctx,
     async (instance) => {
-      ctx.signal?.throwIfAborted();
+      ctx.signal.throwIfAborted();
       const dropped = await instance.drop(input.table_name);
       await ctx.state.delete(key(instance, input.table_name));
       return {

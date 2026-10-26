@@ -4,7 +4,7 @@ import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
 import { formatResult } from '@/domain/format.js';
-import { analyticalShape, analyzeScope } from './analytics.js';
+import { analyticalShape, analyzeScope, rowSetsInput } from './analytics.js';
 import {
   commonInput,
   id,
@@ -28,15 +28,20 @@ const Output = z.union([
 /** Whole-filing reported amounts are overlapping issue associations. */
 export const getIssueSpending = tool(NAME, {
   description:
-    'Aggregate separate income and expense amounts on quarterly filings mentioning issue_code across explicit years. This is whole-filing association, not allocated issue spending; issue buckets overlap. All versions are acquired before latest-period selection and local issue filtering. Broad scans can take hours and exhaust temporary storage; narrow client_id or registrant_id when appropriate. Follow collecting cursors before interpreting final typed rows or optional SQL datasets.',
+    'Aggregate separate income and expense amounts on quarterly filings mentioning issue_code across explicit years. This is whole-filing association, not allocated issue spending; issue buckets overlap. All versions are acquired before latest-period selection and local issue filtering. Broad scans can take hours; narrow client_id or registrant_id when appropriate. Follow collecting cursors before interpreting final typed rows or SQL datasets. Pass a selected filing UUID to uslobbying_search_filings for its complete record.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    row_sets: rowSetsInput,
     issue_code: z
       .string()
       .optional()
       .describe('Required first-call code from uslobbying_list_reference topic issue_codes.'),
-    client_id: id.optional().describe('Optional native client scope.'),
+    client_id: id
+      .optional()
+      .describe(
+        'Optional client relationship record ID from candidates[].id in uslobbying_get_client_profile resolve mode; candidates[].client_id is secondary.',
+      ),
     registrant_id: id.optional().describe('Optional native registrant scope.'),
     years: z
       .array(year)
@@ -111,7 +116,7 @@ export const getIssueSpending = tool(NAME, {
     if (resolved.record) return Output.parse(resolved.record);
     const f = resolved.filters;
     if (typeof f.issue_code !== 'string') invalid('issue_code is required on the first call.');
-    await verifyCode('issue_codes', f.issue_code, ctx);
+    if (!input.cursor) await verifyCode('issue_codes', f.issue_code, ctx);
     const years = z.array(year).min(1).safeParse(f.years);
     if (!years.success) invalid('Analytical mode requires explicit nonempty years.');
     const partitions: Record<string, string | number | boolean>[] = [];

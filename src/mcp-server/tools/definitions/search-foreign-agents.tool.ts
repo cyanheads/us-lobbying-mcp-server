@@ -9,6 +9,7 @@ import {
   RecordWindowInputShape,
   RecordWindowSchema,
 } from '@/domain/contracts.js';
+import { deliveryDisclosure, normalizeDelivery } from '@/domain/delivery-limits.js';
 import { FaraRecordSchema } from '@/domain/fara.js';
 import { formatResult } from '@/domain/format.js';
 import { type JsonValue, JsonValueSchema, optionalText } from '@/domain/json.js';
@@ -50,11 +51,12 @@ const scopeSchema = z.strictObject({
   ).describe('Detail collection, default foreign_principals; unavailable in search mode.'),
   page_size: z
     .number()
-    .int()
+    .multipleOf(1)
     .min(1)
-    .max(25)
     .optional()
-    .describe('Maximum records in one local output window, default 25.'),
+    .describe(
+      'Maximum records in one local output window; positive integers clamp to 25, default 25.',
+    ),
 });
 const output = ProvenanceSchema.extend({
   truncated: z
@@ -161,9 +163,10 @@ export const searchForeignAgentsTool = tool(NAME, {
       reason: 'source_schema_changed',
       code: JsonRpcErrorCode.SerializationError,
       thrownBy: 'service',
-      when: 'A successful source response violates the verified schema.',
+      retryable: false,
+      when: 'A source response violates the verified schema or uses an unsupported redirect.',
       recovery:
-        'Use uslobbying_list_reference topic methodology for source limitations; retry the source tool after the upstream response format is supported.',
+        'Use uslobbying_list_reference topic methodology for source limitations; retry after the upstream response format or redirect route is supported.',
     },
     {
       reason: 'snapshot_unavailable',
@@ -192,6 +195,8 @@ export const searchForeignAgentsTool = tool(NAME, {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
+    const disclosure = deliveryDisclosure(input);
+    input = normalizeDelivery(input);
     const supplied = scopeSchema.parse(
       Object.fromEntries(
         Object.entries(input).filter(([key]) => Object.hasOwn(scopeSchema.shape, key)),
@@ -209,7 +214,17 @@ export const searchForeignAgentsTool = tool(NAME, {
           'record_handle is exclusive with source selectors and cursor.',
         );
       return output.parse(
-        await readRecordWindow(ctx, { ...input, tool: NAME, record_handle: input.record_handle }),
+        await readRecordWindow(ctx, {
+          ...input,
+          tool: NAME,
+          record_handle: input.record_handle,
+          buildResponse: (record_window, provenance) => ({
+            ...provenance,
+            ...disclosure,
+            record_window,
+            truncated: !record_window.complete,
+          }),
+        }),
       );
     }
     if (input.record_path !== '' || input.record_offset !== 0 || input.record_limit !== 25)
@@ -274,6 +289,7 @@ export const searchForeignAgentsTool = tool(NAME, {
     const provenance = source
       ? z.record(z.string(), JsonValueSchema).parse({
           source: 'fara',
+          ...disclosure,
           effective_filters: filters,
           ...sourceMetadata,
           notices: [
@@ -298,6 +314,7 @@ export const searchForeignAgentsTool = tool(NAME, {
         createHash('sha256').update(JSON.stringify(record)).digest('hex'),
       buildResponse: (window, _metadata, stored) => ({
         ...stored,
+        ...disclosure,
         mode,
         ...(entity && { entity }),
         ...(detail && { detail }),

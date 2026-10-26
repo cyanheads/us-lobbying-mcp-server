@@ -1,6 +1,9 @@
 /** @fileoverview Pure relationship-period selection and exact disclosure accounting. @module services/lobbying/analysis */
-import type { ContributionReport, Filing } from '@/domain/lda.js';
+import type { z } from '@cyanheads/mcp-ts-core';
+import type { ContributionReport, Filing, GovernmentEntitySchema } from '@/domain/lda.js';
 import { ActivityRowSchema, ContributionReportSchema, MoneySchema } from '@/domain/lda.js';
+
+type GovernmentEntity = z.infer<typeof GovernmentEntitySchema>;
 
 const METHOD = 'latest_posted_within_relationship_period' as const;
 const PERIODS = ['first_quarter', 'second_quarter', 'third_quarter', 'fourth_quarter'];
@@ -77,29 +80,23 @@ export async function selectQuarterlyFilings(
       period: filing.filing_period,
       selection_method: METHOD,
     };
+    const excluded = {
+      ...base,
+      status: 'excluded' as const,
+      candidate_filing_uuids: [filing.filing_uuid],
+      superseded_filing_uuids: [],
+    };
     const reason = ['RR', 'RA'].includes(filing.filing_type)
       ? 'registration'
       : !PERIODS.includes(filing.filing_period)
         ? 'non_quarterly'
         : undefined;
     if (reason) {
-      selections.push({
-        ...base,
-        status: 'excluded',
-        candidate_filing_uuids: [filing.filing_uuid],
-        superseded_filing_uuids: [],
-        exclusion_reason: reason,
-      });
+      selections.push({ ...excluded, exclusion_reason: reason });
       continue;
     }
     if (!hasRelationship(filing)) {
-      selections.push({
-        ...base,
-        status: 'excluded',
-        candidate_filing_uuids: [filing.filing_uuid],
-        superseded_filing_uuids: [],
-        exclusion_reason: 'missing_relationship',
-      });
+      selections.push({ ...excluded, exclusion_reason: 'missing_relationship' });
       continue;
     }
     const key = JSON.stringify([base.registrant_id, base.client_id, base.year, base.period]);
@@ -171,17 +168,13 @@ export function matchesFiling(filing: Filing, predicates: FilingPredicates): boo
   for (const field of ['income', 'expenses'] as const) {
     const minimum = predicates[`${field}_min`];
     const maximum = predicates[`${field}_max`];
+    if (minimum === undefined && maximum === undefined) continue;
     const amount = filing[field];
+    if (amount == null) return false;
+    const cents = moneyToCents(amount);
     if (
-      (minimum !== undefined || maximum !== undefined) &&
-      (amount === undefined || amount === null)
-    )
-      return false;
-    if (
-      amount !== undefined &&
-      amount !== null &&
-      ((minimum !== undefined && moneyToCents(amount) < moneyToCents(minimum)) ||
-        (maximum !== undefined && moneyToCents(amount) > moneyToCents(maximum)))
+      (minimum !== undefined && cents < moneyToCents(minimum)) ||
+      (maximum !== undefined && cents > moneyToCents(maximum))
     )
       return false;
   }
@@ -218,14 +211,13 @@ function ledger(year: number, filings: readonly Filing[], ambiguous: number): An
       income += moneyToCents(filing.income);
       incomeCount++;
     }
-    if (filing.expenses != null) {
-      expenses += moneyToCents(filing.expenses);
-      expenseCount++;
-    }
     const method = filing.expenses_method ?? null;
     const entry = methods.get(method) ?? { sum: 0n, known: 0, missing: 0 };
     if (filing.expenses != null) {
-      entry.sum += moneyToCents(filing.expenses);
+      const cents = moneyToCents(filing.expenses);
+      expenses += cents;
+      expenseCount++;
+      entry.sum += cents;
       entry.known++;
     } else entry.missing++;
     methods.set(method, entry);
@@ -264,6 +256,14 @@ export async function analyzeFilings(
   const selection = await selectQuarterlyFilings(filings);
   const selected = selection.selected.filter((filing) => matchesFiling(filing, predicates));
   const years = [...new Set(selection.selections.map((item) => item.year))].sort((a, b) => a - b);
+  const breakdownLedgers = (records: readonly Filing[]) =>
+    years.map((year) =>
+      ledger(
+        year,
+        records.filter((filing) => filing.filing_year === year),
+        0,
+      ),
+    );
   const annual_ledgers = years.map((year) =>
     ledger(
       year,
@@ -277,15 +277,7 @@ export async function analyzeFilings(
     { registrant_id: string; name: string; client_ids: Set<string>; filings: Filing[] }
   >();
   const issues = new Map<string, Filing[]>();
-  const entities = new Map<
-    string,
-    {
-      entity: NonNullable<
-        NonNullable<Filing['lobbying_activities']>[number]['government_entities']
-      >[number];
-      filing_uuids: Set<string>;
-    }
-  >();
+  const entities = new Map<string, { entity: GovernmentEntity; filing_uuids: Set<string> }>();
   for (const filing of selected) {
     const firm = firms.get(filing.registrant.id) ?? {
       registrant_id: filing.registrant.id,
@@ -321,24 +313,12 @@ export async function analyzeFilings(
       name: firm.name,
       client_ids: [...firm.client_ids],
       filing_uuids: firm.filings.map((filing) => filing.filing_uuid),
-      annual_ledgers: years.map((year) =>
-        ledger(
-          year,
-          firm.filings.filter((filing) => filing.filing_year === year),
-          0,
-        ),
-      ),
+      annual_ledgers: breakdownLedgers(firm.filings),
     })),
     issue_codes: [...issues].map(([issue_code, records]) => ({
       issue_code,
       filing_uuids: records.map((filing) => filing.filing_uuid),
-      annual_ledgers: years.map((year) =>
-        ledger(
-          year,
-          records.filter((filing) => filing.filing_year === year),
-          0,
-        ),
-      ),
+      annual_ledgers: breakdownLedgers(records),
     })),
     targeted_entities: [...entities.values()].map((value) => ({
       entity: value.entity,
@@ -368,6 +348,8 @@ export async function analyzeFilings(
 }
 /** All child predicates must match one child; parent reports and repeated child rows stay whole. */
 export interface ContributionPredicates {
+  amount_max?: string;
+  amount_min?: string;
   contribution_date_after?: string;
   contribution_date_before?: string;
   contribution_type?: string;
@@ -380,7 +362,20 @@ export function matchContributionItems(
   report: ContributionReport,
   predicates: ContributionPredicates = {},
 ): number[] {
+  const minimum =
+    predicates.amount_min === undefined ? undefined : moneyToCents(predicates.amount_min);
+  const maximum =
+    predicates.amount_max === undefined ? undefined : moneyToCents(predicates.amount_max);
   return report.contribution_items.flatMap((item, index) => {
+    if (minimum !== undefined || maximum !== undefined) {
+      if (item.amount == null) return [];
+      const amount = moneyToCents(item.amount);
+      if (
+        (minimum !== undefined && amount < minimum) ||
+        (maximum !== undefined && amount > maximum)
+      )
+        return [];
+    }
     if (predicates.contribution_type && item.contribution_type !== predicates.contribution_type)
       return [];
     for (const [key, value] of [

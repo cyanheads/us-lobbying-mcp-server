@@ -67,7 +67,7 @@ describe('complete XML snapshots', () => {
       '/bulk/zip/FARA_All_Registrants.xml.zip',
     ]);
     expect(calls[0]?.init).toMatchObject({
-      redirect: 'error',
+      redirect: 'manual',
       headers: { Accept: 'application/zip' },
     });
   });
@@ -163,6 +163,178 @@ describe('complete XML snapshots', () => {
 });
 
 describe('live detail shapes', () => {
+  const target =
+    'https://efile.fara.gov/CallAPI/GetJSON?a=f?p=API:REGISTRANTDOCS-F_XML:::::F_XML_REG_NUM,F_XML_CC,F_XML_DOC_TYPE:5931,,';
+  it('follows one paced registrant-documents redirect and retains both source URLs', async () => {
+    const raw = {
+      REGISTRATION_NUMBER: '5931',
+      DOCUMENT_TYPE: 'Supplement',
+      URL: 'https://efile.fara.gov/docs/source.pdf',
+      future: { retained: [null, false, 0] },
+    };
+    const { service, calls } = boundary((url) =>
+      url.pathname.startsWith('/api/')
+        ? new Response(null, { status: 302, headers: { Location: target } })
+        : Response.json({ ROWSET: { ROW: raw } }),
+    );
+    const result = await settle(
+      service.detail({ detail: 'documents', registration_number: '5931' }, signal()),
+    );
+    expect(result.records[0]?.raw).toEqual(raw);
+    expect(result.source_urls).toEqual(['https://efile.fara.gov/api/v1/RegDocs/json/5931', target]);
+    expect(calls.map((call) => call.url.href)).toEqual(result.source_urls);
+    expect(calls.map((call) => call.at - calls[0]!.at)).toEqual([0, 4100]);
+    expect(calls.every((call) => call.init?.redirect === 'manual')).toBe(true);
+  });
+  it.each([
+    target.replace('efile.fara.gov', 'outside.example'),
+    target.replace('https:', 'http:'),
+    target.replace('efile.fara.gov', 'user@efile.fara.gov'),
+    `${target}#fragment`,
+    `${target}#`,
+    `${target}&extra=1`,
+    `${target}&a=duplicate`,
+    target.replace('5931,,', '5932,,'),
+    target.replace('/CallAPI/GetJSON', '/other'),
+    '',
+  ])('rejects unsupported document redirect without contacting target: %s', async (location) => {
+    const { service, calls } = boundary(
+      () => new Response(null, { status: 302, headers: { Location: location } }),
+    );
+    await expect(
+      settle(service.detail({ detail: 'documents', registration_number: '5931' }, signal())),
+    ).rejects.toMatchObject({ data: { reason: 'source_schema_changed', retryable: false } });
+    expect(calls).toHaveLength(1);
+  });
+  it('rejects a second redirect without retrying the chain', async () => {
+    const { service, calls } = boundary(
+      () => new Response(null, { status: 302, headers: { Location: target } }),
+    );
+    await expect(
+      settle(service.detail({ detail: 'documents', registration_number: '5931' }, signal())),
+    ).rejects.toMatchObject({ data: { reason: 'source_schema_changed', retryable: false } });
+    expect(calls).toHaveLength(2);
+  });
+  it('retains the empty-collection caveat after a redirect for a lossless fabricated ID', async () => {
+    const id = '987654321987654321';
+    const location = target.replace('5931,,', `${id},,`);
+    const { service, calls } = boundary((url) =>
+      url.pathname.startsWith('/api/')
+        ? new Response(null, { status: 302, headers: { Location: location } })
+        : Response.json({ ROWSET: '' }),
+    );
+    const result = await settle(
+      service.detail({ detail: 'documents', registration_number: id }, signal()),
+    );
+    expect(result.records).toEqual([]);
+    expect(result.notices.join(' ')).toContain('does not establish');
+    expect(result.source_urls).toEqual([
+      `https://efile.fara.gov/api/v1/RegDocs/json/${id}`,
+      location,
+    ]);
+    expect(calls).toHaveLength(2);
+  });
+  it.each([429, 500, 502, 503, 504])(
+    'retries a redirected HTTP %s once, pacing every exchange',
+    async (status) => {
+      let targets = 0;
+      const { service, calls } = boundary((url) => {
+        if (url.pathname.startsWith('/api/'))
+          return new Response(null, { status: 302, headers: { Location: target } });
+        targets++;
+        return targets === 1
+          ? new Response('temporary', { status })
+          : Response.json({ ROWSET: '' });
+      });
+      expect(
+        (
+          await settle(
+            service.detail({ detail: 'documents', registration_number: '5931' }, signal()),
+          )
+        ).records,
+      ).toEqual([]);
+      expect(calls.map((call) => call.url.pathname)).toEqual([
+        '/api/v1/RegDocs/json/5931',
+        '/CallAPI/GetJSON',
+        '/api/v1/RegDocs/json/5931',
+        '/CallAPI/GetJSON',
+      ]);
+      expect(calls.slice(1).every((call, index) => call.at - calls[index]!.at >= 4100)).toBe(true);
+    },
+  );
+  it('does not retry a fully read incompatible response after the supported redirect', async () => {
+    const { service, calls } = boundary((url) =>
+      url.pathname.startsWith('/api/')
+        ? new Response(null, { status: 302, headers: { Location: target } })
+        : Response.json({ unsupported: [] }),
+    );
+    await expect(
+      settle(service.detail({ detail: 'documents', registration_number: '5931' }, signal())),
+    ).rejects.toMatchObject({ data: { reason: 'source_schema_changed', retryable: false } });
+    expect(calls).toHaveLength(2);
+  });
+  it('retries a failed redirected body read with the complete two-exchange request', async () => {
+    let targets = 0;
+    const { service, calls } = boundary((url) => {
+      if (url.pathname.startsWith('/api/'))
+        return new Response(null, { status: 302, headers: { Location: target } });
+      if (++targets > 1) return Response.json({ ROWSET: '' });
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new TypeError('Synthetic body read failure'));
+          },
+        }),
+      );
+    });
+    expect(
+      (await settle(service.detail({ detail: 'documents', registration_number: '5931' }, signal())))
+        .records,
+    ).toEqual([]);
+    expect(calls).toHaveLength(4);
+  });
+  it('keeps the original deadline while waiting for the second exchange', async () => {
+    const { service, calls } = boundary(
+      () => new Response(null, { status: 302, headers: { Location: target } }),
+    );
+    await expect(
+      settle(
+        service.detail(
+          { detail: 'documents', registration_number: '5931' },
+          signal(),
+          Date.now() + 1000,
+        ),
+      ),
+    ).rejects.toBeDefined();
+    expect(calls).toHaveLength(1);
+  });
+  it.each(['foreign_principals', 'short_forms'] as const)(
+    'never follows a %s redirect',
+    async (detail) => {
+      const { service, calls } = boundary(
+        () => new Response(null, { status: 302, headers: { Location: target } }),
+      );
+      await expect(
+        settle(service.detail({ detail, registration_number: '5931' }, signal())),
+      ).rejects.toMatchObject({ data: { reason: 'source_schema_changed', retryable: false } });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.init?.redirect).toBe('manual');
+    },
+  );
+  it('preserves cancellation while the redirect waits for its own pacer slot', async () => {
+    const controller = new AbortController();
+    const { service, calls } = boundary(
+      () => new Response(null, { status: 302, headers: { Location: target } }),
+    );
+    const pending = service
+      .detail({ detail: 'documents', registration_number: '5931' }, controller.signal)
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toHaveLength(1);
+    controller.abort(new DOMException('Synthetic cancelled', 'AbortError'));
+    expect(await settle(pending)).toBe(controller.signal.reason);
+    expect(calls).toHaveLength(1);
+  });
   it.each(['foreign_principals', 'short_forms', 'documents'] as const)(
     'accepts sparse singleton and array %s rows, with numeric and lossless string IDs',
     async (detail) => {
@@ -269,6 +441,20 @@ describe('live detail shapes', () => {
 });
 
 describe('transport and shared snapshot lifetime', () => {
+  it('refuses snapshot redirects once without contacting the supplied target', async () => {
+    const { service, calls } = boundary(
+      () =>
+        new Response(null, {
+          status: 302,
+          headers: { Location: 'https://outside.example/snapshot.zip' },
+        }),
+    );
+    await expect(settle(service.search({}, signal()))).rejects.toMatchObject({
+      data: { reason: 'source_schema_changed', retryable: false },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url.href).toBe('https://efile.fara.gov/bulk/zip/FARA_All_Registrants.xml.zip');
+  });
   it('classifies plain-text 404 without retry and plain-text 429 with one retry', async () => {
     for (const status of [404, 429]) {
       const { service, calls } = boundary(

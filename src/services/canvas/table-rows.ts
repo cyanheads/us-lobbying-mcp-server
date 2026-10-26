@@ -75,10 +75,10 @@ function project(
 export async function* filingRows(
   rows: RowSource<Filing>,
   decisions: ReadonlyMap<string, FilingAudit>,
-  signal?: AbortSignal,
+  signal: AbortSignal,
 ) {
   for await (const filing of rows) {
-    signal?.throwIfAborted();
+    signal.throwIfAborted();
     const decision = decisions.get(filing.filing_uuid);
     if (!decision) throw new Error('Every staged filing requires a version-selection decision.');
     const { income, expenses, ...source } = filing;
@@ -96,9 +96,9 @@ export async function* filingRows(
 }
 
 /** Stream child rows with their parent UUID and original array index. */
-export async function* activityRows(rows: RowSource<ActivityRow>, signal?: AbortSignal) {
+export async function* activityRows(rows: RowSource<ActivityRow>, signal: AbortSignal) {
   for await (const activity of rows) {
-    signal?.throwIfAborted();
+    signal.throwIfAborted();
     yield project(activity, activityColumns);
   }
 }

@@ -10,7 +10,7 @@ import {
   resolveCheckpoint,
   serveResults,
 } from '../../../src/services/acquisition/acquisition-service.js';
-import { writeJson } from '../../../src/services/acquisition/storage.js';
+import { readJson, writeJson } from '../../../src/services/acquisition/storage.js';
 import type { DeliveryWindow, ResponseBuilder } from '../../../src/services/acquisition/types.js';
 
 const buildResponse: ResponseBuilder = (window, metadata) => ({ ...window, ...metadata });
@@ -57,6 +57,110 @@ afterEach(() => {
 });
 
 describe('revisioned acquisition', () => {
+  it('aggregates latest partition envelope counts only after every partition is known', async () => {
+    const ctx = createMockContext();
+    const pages = [
+      {
+        records: [{ id: 'a' }, { id: 'a' }],
+        upstreamCount: 4,
+        partition: { index: 0, total: 2 },
+        next: 1,
+      },
+      { records: [{ id: 'b' }], upstreamCount: 3, partition: { index: 0, total: 2 }, next: 2 },
+      { records: [], upstreamCount: 0, partition: { index: 1, total: 2 }, next: null },
+    ];
+    const upstream = {
+      identify,
+      fetchPage: vi.fn(
+        async (position: JsonValue) => pages[position === null ? 0 : Number(position)]!,
+      ),
+    };
+    const first = await acquire(ctx, { ...base, source: upstream });
+    expect(first.checkpoint.coverage).not.toHaveProperty('upstream_count');
+    const second = await acquire(ctx, {
+      ...base,
+      source: upstream,
+      cursor: first.checkpoint.cursor,
+    });
+    expect(second.checkpoint.coverage).not.toHaveProperty('upstream_count');
+    const final = await acquire(ctx, {
+      ...base,
+      source: upstream,
+      cursor: second.checkpoint.cursor,
+    });
+    expect(final.checkpoint.coverage).toMatchObject({
+      upstream_count: 3,
+      records_fetched: 3,
+      unique_records: 2,
+      complete: true,
+    });
+    expect(
+      (await acquire(ctx, { ...base, source: upstream, cursor: second.checkpoint.cursor }))
+        .response,
+    ).toEqual(final.response);
+    expect(upstream.fetchPage).toHaveBeenCalledTimes(3);
+    surfaces(final.response);
+  });
+  it('keeps unknown partition counts absent and advances legacy manifests without inventing earlier counts', async () => {
+    const ctx = createMockContext();
+    const pages = [
+      { records: [1], upstreamCount: 7, partition: { index: 0, total: 2 }, next: 1 },
+      { records: [1], partition: { index: 1, total: 2 }, next: null },
+    ];
+    const upstream = {
+      identify,
+      fetchPage: vi.fn(
+        async (position: JsonValue) => pages[position === null ? 0 : Number(position)]!,
+      ),
+    };
+    const first = await acquire(ctx, { ...base, source: upstream });
+    const key = `acquisition/scan/${first.checkpoint.cursor.split('.')[0]}`;
+    const stored = (await ctx.state.get(key)) as Record<string, unknown>;
+    delete stored.partitions;
+    await ctx.state.set(key, stored);
+    const final = await acquire(ctx, {
+      ...base,
+      source: upstream,
+      cursor: first.checkpoint.cursor,
+    });
+    expect(final.checkpoint.coverage).toMatchObject({
+      complete: true,
+      records_fetched: 2,
+      unique_records: 1,
+    });
+    expect(final.checkpoint.coverage).not.toHaveProperty('upstream_count');
+    expect(final.checkpoint.partitions).toEqual({
+      total: 2,
+      observed: { '1': { recordsFetched: 1, completeHistory: false } },
+    });
+    surfaces(final.response);
+  });
+  it('distinguishes unavailable state from unreadable values and provider failures', async () => {
+    const ctx = createMockContext();
+    await expect(readJson(ctx, 'missing')).rejects.toMatchObject({
+      message: 'The continuation or record is unavailable; restart the original scoped request.',
+      data: { reason: 'cursor_invalid' },
+    });
+    const get = vi.spyOn(ctx.state, 'get');
+    get.mockResolvedValueOnce(Number.NaN);
+    await expect(readJson(ctx, 'malformed')).rejects.toMatchObject({
+      message: 'The stored acquisition is unreadable; restart the original scoped request.',
+      data: { reason: 'cursor_invalid' },
+    });
+    get.mockRejectedValueOnce(new Error('provider failed'));
+    await expect(readJson(ctx, 'broken')).rejects.toMatchObject({
+      message: 'The stored acquisition is unreadable; restart the original scoped request.',
+    });
+    const controller = new AbortController();
+    const cancellation = new DOMException('caller cancelled read', 'AbortError');
+    get.mockImplementationOnce(async () => {
+      controller.abort(cancellation);
+      return null;
+    });
+    await expect(readJson({ ...ctx, signal: controller.signal }, 'cancelled')).rejects.toBe(
+      cancellation,
+    );
+  });
   it('refuses default-provider entry exhaustion and admits work after absolute expiry', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2090-01-01'));
@@ -173,7 +277,7 @@ describe('revisioned acquisition', () => {
       { data: { reason: 'cursor_invalid' } },
     );
     await expect(acquire(ctx, { ...continuation, filters: { year: 2024 } })).rejects.toMatchObject({
-      data: { reason: 'invalid_filter' },
+      data: { reason: 'cursor_invalid' },
     });
     await expect(
       acquire(

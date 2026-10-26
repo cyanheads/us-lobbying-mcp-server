@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![npm](https://img.shields.io/npm/v/@cyanheads/us-lobbying-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/us-lobbying-mcp-server) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/us-lobbying-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/us-lobbying-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/us-lobbying-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/us-lobbying-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -19,11 +19,17 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://us-lobbying.caseyjhand.com/mcp](https://us-lobbying.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Overview
 
-US federal lobbying disclosures from the Senate's LDA API and foreign-agent registrations from the Department of Justice's FARA records. Search filings, resolve client relationships, inspect lobbyist and contribution disclosures, and analyze reported amounts with optional local SQL. No API key required.
+US federal lobbying disclosures from the Senate's LDA API and foreign-agent registrations from the Department of Justice's FARA records. Search filings, resolve client relationships, inspect lobbyist and contribution disclosures, and analyze reported amounts with optional local SQL. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above; no API key required.
 
 ### Tools
 
@@ -44,36 +50,39 @@ US federal lobbying disclosures from the Senate's LDA API and foreign-agent regi
 
 ### `uslobbying_search_filings` <sub>tool</sub>
 
-- Supply at least one upstream filter: `filing_year` (1999–current UTC year), `client_id`, `registrant_id`, `lobbyist_id`, `client_name`, `registrant_name`, `filing_type`, `filing_period`, or `specific_issues`. Optional `issue_code` is applied locally and cannot narrow upstream requests.
+- Supply at least one upstream filter: `filing_uuid`, `filing_year` (1999–current UTC year), client/registrant/lobbyist ID or name, `filing_type`, `filing_period`, `specific_issues`, `posted_after` / `posted_before`, `amount_min` / `amount_max`, `client_state`, `client_country`, `foreign_entity_name`, or `foreign_entity_country`. Dates are real `YYYY-MM-DD` calendar dates; amounts are exact decimal USD strings with at most two fractional digits and use native filing-filter semantics. Text is trimmed, blanks omitted, and state/country codes uppercased. Filters combine conjunctively; optional `issue_code` applies locally and cannot narrow upstream requests.
+- Pass a `filing_uuid` from lobbyist evidence or analytical selections to retrieve the complete filing, including nested source fields and document links.
 - Returns complete `filings` with `amendment_policy: "all_versions"`, separate nullable USD decimal-string `income` / `expenses`, document links, and nested disclosures. Shared acquisition and record-window rules appear under Features.
 
 ---
 
 ### `uslobbying_get_client_profile` <sub>tool</sub>
 
-- `mode: "resolve"` (default) requires `client_name`; `mode: "profile"` requires explicit `client_ids` and `years` (1999–current UTC year). IDs identify relationships with registrants; candidates are never automatically merged into a corporate identity.
+- `mode: "resolve"` (default) requires `client_name`; `mode: "profile"` requires explicit `client_ids` and `years` (1999–current UTC year). Pass each candidate's `id`, not its registrant-assigned `client_id`. IDs identify relationships with registrants; candidates are never automatically merged into a corporate identity.
 - Profile returns `status: "collecting"` until acquisition completes, then typed `annual_ledgers`, `selections`, `firms`, `issue_codes`, `targeted_entities`, `selected_filings`, `activities`, and `raw_filings` across output windows. `row_set_totals` / `row_set_offsets` describe each list's delivery.
-- With `CANVAS_PROVIDER_TYPE=duckdb`, completed analysis also returns a `dataset` containing all acquired filings, selected filings, and selected activities. Optional `canvas_id` reuses an existing canvas; an expired token fails `canvas_not_found`.
+- Optional nonempty, unique `row_sets` selects which of those lists to deliver inline. Omission delivers every set; `raw_filings` always means every acquired version, including selected versions. Selection never limits acquisition, analysis, complete-set totals or SQL staging. Omitted sets remain available by restarting the same scope with another selection or querying staged tables. Continue with omitted or equivalent `row_sets`; changing the selection fails `cursor_invalid`. Offsets, handles and `output_complete` follow the selected stream; notices remain deliverable for every selection.
+- Empty client/year partitions produce factual notices naming the selected ID and year; zero rows do not establish whether an ID is valid. Notices share bounded delivery windows and count in `total_records` and delivery counters, while `row_set_totals` counts domain rows only. Follow every cursor.
+- With `CANVAS_PROVIDER_TYPE=duckdb`, the first completed-acquisition delivery window returns a `dataset` containing all acquired filings, selected filings, and selected activities. Its exact replay retains the dataset; later windows retain `canvas_id`, `describe_tool`, `query_tool` and table guidance without repeating schemas. Optional input `canvas_id` reuses an existing canvas; an expired token fails `canvas_not_found`.
 
 ---
 
 ### `uslobbying_get_issue_spending` <sub>tool</sub>
 
 - Requires `issue_code` and explicit `years`; optional `client_id` / `registrant_id` narrow upstream acquisition. All versions are acquired before latest-period selection and local issue filtering; broad scans can take hours.
-- Returns the same collecting/final analytical lists and optional dataset as profile mode, with `attribution_basis: "whole_filing_mentions_issue"`. Whole-filing amounts overlap across issue buckets and are not allocated issue spending.
+- Returns the same collecting/final analytical lists, optional `row_sets` selection and dataset routing as profile mode, with `attribution_basis: "whole_filing_mentions_issue"`. Whole-filing amounts overlap across issue buckets and are not allocated issue spending.
 
 ---
 
 ### `uslobbying_search_lobbyists` <sub>tool</sub>
 
 - `mode: "search"` (default) requires `name`, `registrant_name`, or `registrant_id`; `mode: "activity"` requires `lobbyist_id` and `filing_year`, with optional `client_id` and `covered_positions_only`.
-- Returns identity `lobbyists` or filing-scoped `evidence`, including the matching participant, complete activity, original indexes, and filing UUID/document. Covered positions are disclosed text, not verified current employment.
+- Returns identity `lobbyists` or filing-scoped `evidence`, including the matching participant, complete activity, original indexes, and filing UUID/document. Use that UUID with `uslobbying_search_filings` for the complete filing. Covered positions are disclosed text, not verified current employment.
 
 ---
 
 ### `uslobbying_get_contributions` <sub>tool</sub>
 
-- Requires `filing_year` (2008–current UTC year); optional `filing_period` (`mid_year` / `year_end`), registrant/lobbyist selectors, `contribution_type`, `contributor`, `payee`, `honoree`, and inclusive `contribution_date_after` / `contribution_date_before`.
+- Requires `filing_year` (2008–current UTC year); optional `filing_period` (`mid_year` / `year_end`), registrant/lobbyist selectors, `contribution_type`, `contributor`, `payee`, `honoree`, inclusive `contribution_date_after` / `contribution_date_before`, and inclusive local item `amount_min` / `amount_max` decimal USD strings. Unknown item amounts cannot satisfy a bound. Contribution amount predicates run locally because native amount filters do not reliably select matching reports.
 - Returns full parent `reports`, complete `contribution_items`, and `matched_item_indexes` where every child predicate matched the same item. Originals and amendments remain separate; `report_count_in_batch` and `item_count_in_batch` are not donation totals.
 
 ---
@@ -82,7 +91,7 @@ US federal lobbying disclosures from the Senate's LDA API and foreign-agent regi
 
 - `mode: "search"` (default) searches daily XML snapshots; choose `entity: "registrants"` (default) or `"foreign_principals"`, optional literal token-AND `name_contains`, and exact `country` labels for principals only. `status` is `active` (default), `terminated`, or `all`; principal status is independent of registrant status.
 - `mode: "detail"` requires a digit-string `registration_number` and retrieves only the chosen live collection: `foreign_principals` (default), `short_forms`, or `documents`. Documents require `status: "all"` (the effective default for documents); an empty collection does not prove a registration never existed.
-- `page_size` 1–25 (default 25) controls local windows over pinned results; follow `next_cursor`. Responses retain source fields, official links, and snapshot retrieval metadata where applicable.
+- `page_size` controls local windows over pinned results (default 25; larger positive integers clamp to 25); follow `next_cursor`. Responses retain source fields, official links, and snapshot retrieval metadata where applicable.
 
 ---
 
@@ -95,7 +104,7 @@ US federal lobbying disclosures from the Senate's LDA API and foreign-agent regi
 
 ### `uslobbying_dataframe_query` <sub>tool</sub>
 
-- Requires `canvas_id` and either one read-only SELECT in `sql` (optional fresh `register_as`) or a stored `result_table` with optional `offset`. `row_limit` 1–100 defaults to 25 and may be lowered by framework configuration or the response byte budget.
+- Requires `canvas_id` and either one read-only SELECT in `sql` (optional fresh `register_as`) or a stored `result_table` with optional `offset`. `row_limit` defaults to 25; larger positive integers clamp to 100, then any lower provider ceiling. The response byte budget may deliver fewer whole rows.
 - New SQL materializes the complete result. Continue with `result_table` / `next_offset`; `row_count` is exact and `row_order: "canonical_values"` describes delivery ordering. Writes, multiple statements, external reads, and prohibited plan operators fail with typed reasons.
 - A row that cannot fit fails `query_row_too_large` while retaining the materialization: select fewer columns or explicit `SUBSTR` windows. Missing/expired tables fail `missing_table`; SQL is unavailable without an enabled canvas.
 
@@ -126,14 +135,22 @@ LDA/FARA-specific:
 
 Agent-friendly output:
 
-- Explicit completion: LDA `page_size` is 1–25 (default 25); `max_pages` is 1–5 (default one for discovery, five for analytics). Follow `next_cursor` until acquisition `coverage.complete`, then continue final windows until `output_complete`; `record_handles` can still require retrieval. Filters may be omitted or repeated unchanged on continuation.
-- Complete record retrieval: responses target 24,000 UTF-8 bytes across both surfaces. Oversized parents stay reachable through the same tool with `record_handle`, JSON Pointer `record_path`, and `record_offset` / `record_limit` (1–25 object entries or array items, default 25). String windows use byte-bounded fragments and Unicode-code-point offsets; follow child paths and `next_offset` to reconstruct values.
-- Recoverable progress: continuations and retained parents expire 24 hours after acquisition starts. The immediately preceding cursor replays its response; older or expired cursors fail `cursor_invalid`. In-memory restarts lose progress; explicit filesystem storage retains public records/checkpoints until expiry. Broad scans can exhaust the default 128 MiB acquisition budget or exceed the lifetime; narrow year/client/registrant scopes deliberately.
-- Matching response surfaces: `structuredContent` and JSON text in `content[]` carry the same fields, with clickable source links. Optional analytical `dataset` responses name exact tables and route to describe/query tools; SQL never substitutes for complete inline analytical delivery.
+- Explicit completion: LDA `page_size` defaults to 25 and `max_pages` to one for discovery, five for analytics; larger positive integers clamp to 25 and five respectively. Follow `next_cursor` until `coverage.complete`, then continue final windows until `output_complete`. Filters may be omitted or repeated unchanged; page sizes compare after clamping, while workload controls do not change scope identity.
+- Complete record retrieval: responses target 24,000 UTF-8 bytes across both surfaces. Oversized parents come back as `record_handles`, readable through the same tool with JSON Pointer `record_path` and `record_offset` / `record_limit` (default 25 entries or items, larger positive integers clamp to 25); strings page by Unicode code point within the byte budget.
+- Delivery controls: source/reference responses expose `delivery_limits` with `{requested,effective}` pairs for controls clamped on this call; an empty map means none. SQL returns the same metadata when a ceiling lowers its request. Exact cursor replay retains the original response and its disclosure. Zero, negative, fractional and nonfinite controls remain invalid.
+- Source counts: `coverage.upstream_count`, when known for every partition, sums each partition's latest observed envelope count. It can include duplicate source rows and differs from `unique_records`; live pagination is not a frozen snapshot.
+- Recoverable progress: cursors and retained parents expire 24 hours after acquisition starts. The latest cursor replays its response; older or expired ones fail `cursor_invalid`. In-memory restarts lose progress, filesystem storage keeps it until expiry, and the default 128 MiB acquisition budget favors narrow year/client/registrant scopes.
+- Matching response surfaces: `structuredContent` and the JSON text in `content[]` carry the same fields, plus clickable official source links. Analytical `dataset` responses name the staged tables and route to the describe/query tools.
 
 ## Getting started
 
-Add the following to your MCP client configuration file.
+Connect to the hosted instance, no install:
+
+```sh
+claude mcp add --transport http us-lobbying-mcp-server https://us-lobbying.caseyjhand.com/mcp
+```
+
+Or run it locally. Add the following to your MCP client configuration file.
 
 ```json
 {

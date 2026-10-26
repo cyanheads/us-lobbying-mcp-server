@@ -21,11 +21,20 @@ import {
 } from './types.js';
 
 const rowsSchema = z.array(JsonValueSchema);
+const objectSchema = z.record(z.string(), JsonValueSchema);
 const indexSchema = z.array(z.string());
 const pageSchema = z.object({
   next: JsonValueSchema,
   records: rowsSchema,
   upstreamCount: z.number().int().nonnegative().optional(),
+  partition: z
+    .object({
+      index: z.number().int().nonnegative(),
+      total: z.number().int().positive(),
+      firstPage: z.boolean().optional(),
+    })
+    .refine((value) => value.index < value.total)
+    .optional(),
 });
 const tokenSchema = z.string().regex(/^[a-f0-9-]{36}\.[a-f0-9-]{36}$/);
 function token(id: string): string {
@@ -47,6 +56,7 @@ function checkpoint(manifest: Manifest): AcquisitionCheckpoint {
   return {
     chunkKeys: [...manifest.chunks],
     coverage: { ...manifest.coverage },
+    ...(manifest.partitions ? { partitions: manifest.partitions } : {}),
     cursor: manifest.cursor,
     expiresAt: new Date(manifest.expires).toISOString(),
     filters: manifest.filters,
@@ -57,11 +67,12 @@ function checkpoint(manifest: Manifest): AcquisitionCheckpoint {
     tool: manifest.tool,
   };
 }
+/** An undefined scanKind accepts the stored kind, for callers that resolve it from the cursor. */
 async function load(
   ctx: Context,
   cursor: string,
   tool: string,
-  scanKind: string,
+  scanKind: string | undefined,
   filters?: Record<string, JsonValue>,
 ): Promise<Manifest> {
   if (!tokenSchema.safeParse(cursor).success) throw invalidCursor();
@@ -70,20 +81,20 @@ async function load(
   if (
     !parsed.success ||
     parsed.data.tool !== tool ||
-    parsed.data.scanKind !== scanKind ||
+    (scanKind !== undefined && parsed.data.scanKind !== scanKind) ||
     parsed.data.expires <= Date.now()
   )
     throw invalidCursor();
   const manifest = parsed.data;
   if (filters) {
-    const normalized = z.record(z.string(), JsonValueSchema).parse(filters);
+    const normalized = objectSchema.parse(filters);
     for (const [key, value] of Object.entries(normalized))
       if (
         !Object.hasOwn(manifest.filters, key) ||
         stable(value) !== stable(manifest.filters[key] ?? null)
       )
         throw validationError('Continuation filters must match the original normalized scope.', {
-          reason: 'invalid_filter',
+          reason: 'cursor_invalid',
         });
   }
   if (cursor !== manifest.cursor && cursor !== manifest.replay?.cursor) throw invalidCursor();
@@ -102,8 +113,8 @@ function initial(options: {
     id,
     tool: options.tool,
     scanKind: options.scanKind,
-    filters: z.record(z.string(), JsonValueSchema).parse(options.filters ?? {}),
-    provenance: z.record(z.string(), JsonValueSchema).parse(options.provenance),
+    filters: objectSchema.parse(options.filters ?? {}),
+    provenance: objectSchema.parse(options.provenance),
     revision: 0,
     cursor: token(id),
     expires: started + ACQUISITION_TTL_MS,
@@ -121,6 +132,14 @@ function initial(options: {
     indexes: Array.from({ length: 64 }, () => null),
     retainAll: options.retainAll ?? false,
     delivered: 0,
+  };
+}
+/** Stored provenance plus the current coverage and expiry, retained with any deferred parent. */
+function windowProvenance(manifest: Manifest): Record<string, JsonValue> {
+  return {
+    ...manifest.provenance,
+    coverage: JsonValueSchema.parse(manifest.coverage),
+    cursor_expires_at: new Date(manifest.expires).toISOString(),
   };
 }
 /** Source adapters own all network validation, rate pacing and absolute deadlines. */
@@ -244,6 +263,9 @@ export async function acquire(ctx: Context, options: AcquireOptions): Promise<Ac
       positions: [...current.positions],
     };
     delete next.replay;
+    // Older checkpoints contain only the last page's count; keep replay exact, but do not reuse it as a scope total.
+    if (!next.partitions) delete next.coverage.upstream_count;
+    if (next.partitions) next.partitions = structuredClone(next.partitions);
     const affected = new Map<number, Set<string>>();
     const changedShards = new Set<number>();
     const replaced: string[] = [];
@@ -291,7 +313,30 @@ export async function acquire(ctx: Context, options: AcquireOptions): Promise<Ac
         }
         next.coverage.pages_fetched++;
         next.coverage.records_fetched += page.records.length;
-        if (page.upstreamCount !== undefined) next.coverage.upstream_count = page.upstreamCount;
+        const partition = page.partition ?? { index: 0, total: 1 };
+        next.partitions ??= { total: partition.total, observed: Object.create(null) };
+        if (next.partitions.total !== partition.total)
+          throw serviceUnavailable('The source partition scope changed.', {
+            reason: 'pagination_invalid',
+            retryable: false,
+          });
+        const previous = next.partitions.observed[String(partition.index)];
+        next.partitions.observed[String(partition.index)] = {
+          ...(page.upstreamCount !== undefined ? { count: page.upstreamCount } : {}),
+          recordsFetched: (previous?.recordsFetched ?? 0) + page.records.length,
+          completeHistory:
+            previous?.completeHistory ?? page.partition?.firstPage ?? next.position === null,
+        };
+        const observed = Object.values(next.partitions.observed);
+        if (
+          observed.length === partition.total &&
+          observed.every((entry) => entry.count !== undefined)
+        )
+          next.coverage.upstream_count = observed.reduce(
+            (sum, entry) => sum + (entry.count ?? 0),
+            0,
+          );
+        else delete next.coverage.upstream_count;
         next.position = page.next;
         if (page.next === null) {
           next.coverage.complete = true;
@@ -344,29 +389,20 @@ export async function acquire(ctx: Context, options: AcquireOptions): Promise<Ac
         checkpoint: checkpoint(next),
       });
       await materializeFinal(ctx, next, finalized.records);
-      if (finalized.metadata)
-        next.finalMetadata = z.record(z.string(), JsonValueSchema).parse(finalized.metadata);
+      if (finalized.metadata) next.finalMetadata = objectSchema.parse(finalized.metadata);
     }
     const delivery = next.finalChunks
       ? await finalWindow(ctx, next, {
           identify:
             options.identifyFinal ??
             ((row) => createHash('sha256').update(stable(row)).digest('hex')),
-          provenance: {
-            ...next.provenance,
-            coverage: JsonValueSchema.parse(next.coverage),
-            cursor_expires_at: new Date(next.expires).toISOString(),
-          },
+          provenance: windowProvenance(next),
           buildResponse: options.buildResponse,
         })
       : await windowRows(ctx, next, {
           records: next.pending,
           identify,
-          provenance: {
-            ...next.provenance,
-            coverage: JsonValueSchema.parse(next.coverage),
-            cursor_expires_at: new Date(next.expires).toISOString(),
-          },
+          provenance: windowProvenance(next),
           buildResponse: options.buildResponse,
         });
     if (next.finalChunks) next.finalOffset = (next.finalOffset ?? 0) + delivery.consumed;
@@ -395,12 +431,7 @@ export async function resolveCheckpoint(
   ctx: Context,
   options: { tool: string; cursor: string },
 ): Promise<AcquisitionCheckpoint> {
-  if (!tokenSchema.safeParse(options.cursor).success) throw invalidCursor();
-  const id = options.cursor.split('.')[0];
-  const parsed = ManifestSchema.safeParse(await readJson(ctx, manifestKey(id ?? '')));
-  if (!parsed.success) throw invalidCursor();
-  const manifest = await load(ctx, options.cursor, options.tool, parsed.data.scanKind);
-  return checkpoint(manifest);
+  return checkpoint(await load(ctx, options.cursor, options.tool, undefined));
 }
 /** Stream only complete analytical acquisitions; a missing chunk invalidates the scan. */
 export async function* iterateChunks(
@@ -535,11 +566,7 @@ export async function serveResults(
     const delivery = await finalWindow(ctx, next, {
       ...options,
       maxRecords,
-      provenance: {
-        ...next.provenance,
-        coverage: JsonValueSchema.parse(next.coverage),
-        cursor_expires_at: new Date(next.expires).toISOString(),
-      },
+      provenance: windowProvenance(next),
     });
     next.finalOffset = (next.finalOffset ?? 0) + delivery.consumed;
     next.replay = { cursor: incoming, response: JsonValueSchema.parse(delivery.response) };

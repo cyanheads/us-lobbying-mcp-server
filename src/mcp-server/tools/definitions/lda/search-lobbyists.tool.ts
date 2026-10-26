@@ -3,7 +3,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
 import { formatResult } from '@/domain/format.js';
-import { JsonValueSchema } from '@/domain/json.js';
+import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
 import {
   ActivityLobbyistSchema,
   FilingSchema,
@@ -18,6 +18,7 @@ import {
   envelope,
   id,
   invalid,
+  nativeFilters,
   outputObject,
   provenance,
   recordOutput,
@@ -63,7 +64,7 @@ const Output = z.union([
 /** Find identities before requesting filing-scoped covered-position evidence. */
 export const searchLobbyists = tool(NAME, {
   description:
-    'Find lobbyists by name or registrant in mode search, then retrieve filing-scoped evidence with mode activity, lobbyist_id and filing_year. Covered positions are disclosed text, not verified present employment. Activity mode locally checks the requested lobbyist to prevent attributing another participant’s disclosure. Follow next_cursor for all results.',
+    'Find lobbyists by name or registrant in mode search, then retrieve filing-scoped evidence with mode activity, lobbyist_id and filing_year. Pass an evidence filing_uuid to uslobbying_search_filings for the complete filing. Covered positions are disclosed text, not verified present employment. Activity mode checks the requested lobbyist locally. Follow next_cursor for all results.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
@@ -80,7 +81,11 @@ export const searchLobbyists = tool(NAME, {
     registrant_id: id.optional().describe('Registrant identity ID.'),
     lobbyist_id: id.optional().describe('Required in activity mode.'),
     filing_year: year.optional().describe('Required report year in activity mode.'),
-    client_id: id.optional().describe('Optional activity client relationship scope.'),
+    client_id: id
+      .optional()
+      .describe(
+        'Optional activity client relationship record ID from candidates[].id in uslobbying_get_client_profile resolve mode; candidates[].client_id is secondary.',
+      ),
     covered_positions_only: z
       .boolean()
       .optional()
@@ -156,34 +161,27 @@ export const searchLobbyists = tool(NAME, {
       invalid('Activity mode requires lobbyist_id and filing_year.');
     if (mode === 'search' && !f.name && !f.registrant_name && !f.registrant_id)
       invalid('Search mode requires name or registrant scope.');
-    const native: Record<string, string | number | boolean> = {
-      page_size: Number(f.page_size ?? 25),
-    };
-    for (const key of mode === 'search'
-      ? ['registrant_name', 'registrant_id']
-      : ['lobbyist_id', 'filing_year', 'client_id']) {
-      const value = f[key];
-      if (typeof value === 'string' || typeof value === 'number') native[key] = value;
-    }
+    const native = nativeFilters(
+      f,
+      mode === 'search'
+        ? ['registrant_name', 'registrant_id']
+        : ['lobbyist_id', 'filing_year', 'client_id'],
+    );
     if (typeof f.name === 'string') native.lobbyist_name = f.name;
     if (f.covered_positions_only === true) native.lobbyist_covered_position_indicator = true;
     const upstream = source(mode === 'search' ? 'lobbyists' : 'filings', [native]);
     const result = await acquire(ctx, {
       tool: NAME,
-      scanKind: String(mode),
+      scanKind: mode,
       filters: f,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(input.max_pages ? { maxPages: input.max_pages } : {}),
-      provenance: provenance(f),
+      ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
+      provenance: provenance(f, input),
       source: upstream,
       ...(mode === 'activity'
         ? {
             retainAll: true,
-            finalize({
-              chunks,
-            }: {
-              chunks: AsyncIterable<import('@/domain/json.js').JsonValue[]>;
-            }) {
+            finalize({ chunks }: { chunks: AsyncIterable<JsonValue[]> }) {
               async function* records() {
                 for await (const chunk of chunks)
                   for (const filing of chunk)
@@ -196,7 +194,7 @@ export const searchLobbyists = tool(NAME, {
               }
               return Promise.resolve({ records: records() });
             },
-            identifyFinal: (row: import('@/domain/json.js').JsonValue) => {
+            identifyFinal: (row: JsonValue) => {
               const r = Evidence.parse(row);
               return JSON.stringify([r.filing_uuid, r.activity_index, r.lobbyist_index]);
             },
@@ -208,6 +206,7 @@ export const searchLobbyists = tool(NAME, {
           f,
           'No lobbyist evidence matched the completed scope; use uslobbying_search_lobbyists mode search to resolve the name, then mode activity with its lobbyist_id and a filing_year.',
           stored,
+          input,
         ),
         mode,
         ...(mode === 'search' ? { lobbyists: w.records } : { evidence: w.records }),

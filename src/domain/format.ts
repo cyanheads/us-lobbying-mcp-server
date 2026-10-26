@@ -1,9 +1,10 @@
 /** @fileoverview Lossless JSON text formatting and official document links. @module domain/format */
 import type { JsonValue } from './json.js';
 
+const OFFICIAL_HOSTS = new Set(['lda.gov', 'efile.fara.gov', 'lobbyingdisclosure.house.gov']);
 /** Format every field once as JSON; source fence runs cannot terminate the block. */
 export function formatResult(result: object): { type: 'text'; text: string }[] {
-  const json = JSON.stringify(result, null, 2);
+  const json = JSON.stringify(result);
   const runs = json.match(/`+/g) ?? [];
   const fence = '`'.repeat(runs.reduce((longest, run) => Math.max(longest, run.length + 1), 3));
   const links = new Set<string>();
@@ -16,12 +17,7 @@ export function formatResult(result: object): { type: 'text'; text: string }[] {
       } catch {
         return;
       }
-      if (
-        ['lda.gov', 'efile.fara.gov', 'lobbyingdisclosure.house.gov'].includes(url.hostname) &&
-        !url.username &&
-        !url.password
-      )
-        links.add(url.href);
+      if (OFFICIAL_HOSTS.has(url.hostname) && !url.username && !url.password) links.add(url.href);
     } else if (Array.isArray(value)) {
       for (const item of value) visit(item);
     } else if (value !== null && typeof value === 'object') {

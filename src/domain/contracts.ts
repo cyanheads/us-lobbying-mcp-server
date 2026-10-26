@@ -1,5 +1,6 @@
 /** @fileoverview Shared provenance, delivery windows, datasets and acquisition callbacks. @module domain/contracts */
 import { z } from '@cyanheads/mcp-ts-core';
+import { DeliveryLimitsSchema } from './delivery-limits.js';
 import { type JsonValue, JsonValueSchema } from './json.js';
 
 /** Full serialized MCP result target, including both surfaces and envelope allowance. */
@@ -19,41 +20,37 @@ export const SOURCE_CACHE_TTL_MS = 86_400_000;
 export const CoverageSchema = z.object({
   complete: z.boolean().describe('Whether every source partition has been exhausted.'),
   pages_fetched: z.number().int().nonnegative().describe('Committed upstream pages fetched.'),
-  records_fetched: z
-    .number()
-    .int()
-    .nonnegative()
-    .describe('Upstream rows before UUID deduplication.'),
+  records_fetched: z.number().int().nonnegative().describe('Rows before UUID deduplication.'),
   unique_records: z.number().int().nonnegative().describe('Unique acquired source records.'),
   upstream_count: z
     .number()
     .int()
     .nonnegative()
     .optional()
-    .describe('Source envelope count when known.'),
+    .describe(
+      'Latest partition counts summed only when all are known; includes duplicates, not an immutable snapshot.',
+    ),
   started_at: z.string().describe('Acquisition start ISO timestamp.'),
-  finished_at: z.string().optional().describe('Completed acquisition ISO timestamp.'),
+  finished_at: z.string().optional().describe('Acquisition end ISO timestamp.'),
   next_cursor: z.string().optional().describe('Opaque acquisition or output continuation.'),
 });
 /** Common fields included by every source response. */
 export const ProvenanceSchema = z.object({
+  delivery_limits: DeliveryLimitsSchema,
   source: z.enum(['lda', 'fara']).describe('Official source system.'),
   retrieved_at: z.string().describe('Retrieval ISO timestamp.'),
   effective_filters: z.record(z.string(), JsonValueSchema).describe('Normalized effective scope.'),
-  notices: z.array(z.string()).describe('Limitations and relevant success notices.'),
-  coverage: CoverageSchema.describe('Acquisition progress, independent of output paging.'),
+  notices: z.array(z.string()).describe('Limitations and success notices.'),
+  coverage: CoverageSchema.describe('Acquisition progress, independent of delivery.'),
   attribution: z.string().optional().describe('Required verbatim attribution for LDA data.'),
-  cursor_expires_at: z.string().optional().describe('Absolute continuation expiry ISO timestamp.'),
+  cursor_expires_at: z.string().optional().describe('Continuation expiry ISO timestamp.'),
   snapshot_retrieved_at: z.string().optional().describe('FARA snapshot retrieval timestamp.'),
-  snapshot_source_urls: z
-    .array(z.string())
-    .optional()
-    .describe('Official downloaded snapshot URLs.'),
-  snapshot_last_modified: z.string().optional().describe('Actual upstream Last-Modified header.'),
+  snapshot_source_urls: z.array(z.string()).optional().describe('Official snapshot URLs.'),
+  snapshot_last_modified: z.string().optional().describe('Upstream Last-Modified header.'),
 });
 /** Shared selectors; handlers enforce exclusivity against filters/cursor/canvas. */
 export const RecordWindowInputShape = {
-  record_handle: z.string().optional().describe('Opaque tenant/tool-bound deferred record handle.'),
+  record_handle: z.string().optional().describe('Tenant/tool-bound deferred record handle.'),
   record_path: z
     .string()
     .default('')
@@ -66,12 +63,11 @@ export const RecordWindowInputShape = {
     .describe('Key, item or Unicode-code-point offset.'),
   record_limit: z
     .number()
-    .int()
+    .multipleOf(1)
     .min(1)
-    .max(25)
     .default(25)
     .describe(
-      'Maximum object entries or array items; text fragments use the response byte budget.',
+      'Maximum object entries or array items, clamped to 25; text fragments use the response byte budget.',
     ),
 };
 /** A deferred parent is not counted as a delivered full record. */
@@ -79,25 +75,19 @@ export const RecordHandleSchema = z
   .object({
     record_handle: z.string().describe('Opaque retained parent handle.'),
     source_id: z.string().describe('Original source identity.'),
-    record_bytes: z
-      .number()
-      .int()
-      .nonnegative()
-      .describe('Exact serialized parent UTF-8 byte count.'),
+    record_bytes: z.number().int().nonnegative().describe('Serialized parent UTF-8 bytes.'),
     expires_at: z.string().describe('Retained parent expiry ISO timestamp.'),
-    retrieval_tool: z.string().describe('Same source tool used to retrieve record windows.'),
+    retrieval_tool: z.string().describe('Source tool for record windows.'),
   })
-  .describe('Retained oversized parent and retrieval instructions.');
+  .describe('Deferred parent retrieval.');
 const windowBase = {
-  record_handle: z.string().describe('Opaque stored parent handle.'),
+  record_handle: z.string().describe('Stored parent handle.'),
   path: z.string().describe('Selected JSON Pointer.'),
   total: z.number().int().nonnegative().describe('Total keys, items or code points at this path.'),
   offset: z.number().int().nonnegative().describe('Start position.'),
-  returned: z.number().int().nonnegative().describe('Actually delivered entries or code points.'),
+  returned: z.number().int().nonnegative().describe('Delivered entries or code points.'),
   next_offset: z.number().int().nonnegative().optional().describe('Next undelivered position.'),
-  complete: z
-    .boolean()
-    .describe('Whether this path and included children are completely delivered.'),
+  complete: z.boolean().describe('This path and included children are fully delivered.'),
 };
 /** Discriminated windows preserve parent membership and oversized-child descent paths. */
 export const RecordWindowSchema = z.discriminatedUnion('kind', [
@@ -113,11 +103,11 @@ export const RecordWindowSchema = z.discriminatedUnion('kind', [
               path: z.string().describe('Child JSON Pointer.'),
               value: JsonValueSchema.optional().describe('Whole child value only when it fits.'),
             })
-            .describe('Original key and child pointer; value is present only when it fits.'),
+            .describe('Key and pointer; value only when it fits.'),
         )
         .describe('Key-ordered object window.'),
     })
-    .describe('Object keys and complete or deferred child values.'),
+    .describe('Complete or deferred object children.'),
   z
     .object({
       ...windowBase,
@@ -130,18 +120,18 @@ export const RecordWindowSchema = z.discriminatedUnion('kind', [
               path: z.string().describe('Child JSON Pointer.'),
               value: JsonValueSchema.optional().describe('Whole child value only when it fits.'),
             })
-            .describe('Original array position and child pointer.'),
+            .describe('Original index and child pointer.'),
         )
         .describe('Indexed array window.'),
     })
-    .describe('Array items with preserved original indexes.'),
+    .describe('Array items preserving original indexes.'),
   z
     .object({
       ...windowBase,
       kind: z.literal('string').describe('Unicode text window.'),
       text: z.string().describe('Complete-code-point text fragment.'),
     })
-    .describe('Text fragment ending on a Unicode code point.'),
+    .describe('Unicode-code-point text fragment.'),
   z
     .object({
       ...windowBase,
@@ -154,7 +144,7 @@ export const RecordWindowSchema = z.discriminatedUnion('kind', [
         ])
         .describe('Exact scalar value.'),
     })
-    .describe('Non-text scalar, delivered without fragmentation.'),
+    .describe('Unfragmented non-text scalar.'),
 ]);
 /** Every canvas-token response carries these consumer-facing routing pointers. */
 export const CanvasPointersShape = {
@@ -165,22 +155,22 @@ export const CanvasPointersShape = {
   query_tool: z
     .literal('uslobbying_dataframe_query')
     .describe('Query or retrieve materialized table rows.'),
-  guidance: z.string().describe('Instructions naming actual tables and both dataframe tools.'),
+  guidance: z.string().describe('Table names and dataframe instructions.'),
 };
 /** Exact table lifecycle and grain accompany staged data. */
 export const DatasetTableSchema = z
   .object({
-    table_name: z.string().describe('Actual registered table name.'),
-    row_count: z.number().int().nonnegative().describe('Exact complete registered row count.'),
+    table_name: z.string().describe('Registered table name.'),
+    row_count: z.number().int().nonnegative().describe('Exact registered row count.'),
     columns: z
       .array(
         z
           .object({
             name: z.string().describe('Column name.'),
-            type: z.string().describe('Authoritative provider column type.'),
+            type: z.string().describe('Provider column type.'),
             nullable: z.boolean().describe('Whether null values are permitted.'),
           })
-          .describe('One provider column and its nullability.'),
+          .describe('Provider column.'),
       )
       .describe('Explicit complete schema.'),
     grain: z.string().describe('Meaning of one row; activity rows have no money.'),
@@ -188,16 +178,17 @@ export const DatasetTableSchema = z
     created_at: z.string().describe('Table creation ISO timestamp.'),
     expires_at: z.string().describe('Table expiry ISO timestamp.'),
   })
-  .describe('Complete table schema, grain, count and expiry.');
+  .describe('Complete table metadata.');
 /** Complete staged datasets always advertise describe/query routing. */
 export const DatasetSchema = z.object({
   ...CanvasPointersShape,
-  tables: z.array(DatasetTableSchema).describe('All tables advertised by this dataset.'),
+  tables: z.array(DatasetTableSchema).describe('Dataset tables.'),
 });
 /** Stable materialized-query delivery window; offsets count actually delivered rows. */
 export const QueryWindowSchema = z.object({
+  delivery_limits: DeliveryLimitsSchema,
   ...CanvasPointersShape,
-  dataset: DatasetSchema.describe('Materialized result dataset and routing.'),
+  dataset: DatasetSchema.describe('Materialized dataset and routing.'),
   result_table: z.string().describe('Stable materialized result table.'),
   columns: DatasetTableSchema.shape.columns.describe('Complete result schema.'),
   rows: z.array(z.record(z.string(), JsonValueSchema)).describe('Whole JSON-safe rows.'),
@@ -216,6 +207,7 @@ export type Dataset = z.infer<typeof DatasetSchema>;
 /** Immutable committed page; next is source-owned validated position, never a caller URL. */
 export interface AcquisitionPage<T extends JsonValue> {
   next: JsonValue | null;
+  partition?: { index: number; total: number; firstPage?: boolean };
   records: T[];
   upstreamCount?: number;
 }
@@ -235,6 +227,13 @@ export interface AcquisitionCheckpoint {
   cursor: string;
   expiresAt: string;
   filters: Record<string, JsonValue>;
+  partitions?: {
+    total: number;
+    observed: Record<
+      string,
+      { count?: number | undefined; recordsFetched: number; completeHistory: boolean }
+    >;
+  };
   position: JsonValue | null;
   provenance: Record<string, JsonValue>;
   revision: number;

@@ -8,22 +8,27 @@ import { ContributionReportSchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
 import { matchContributionItems } from '@/services/lobbying/analysis.js';
 import {
+  amountFilter,
   commonInput,
   deliveryShape,
   envelope,
   id,
   invalid,
+  nativeFilters,
   outputObject,
   provenance,
   recordOutput,
   scope,
   source,
+  validateAmountRange,
   verifyCode,
   year,
 } from './shared.js';
 
 const NAME = 'uslobbying_get_contributions';
 const ContributionPredicatesSchema = z.object({
+  amount_min: z.string().optional(),
+  amount_max: z.string().optional(),
   contribution_type: z.string().optional(),
   contributor: z.string().optional(),
   payee: z.string().optional(),
@@ -50,6 +55,12 @@ export const getContributions = tool(NAME, {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    amount_min: amountFilter.describe(
+      'Inclusive local same-item minimum exact decimal USD; complete parent lists remain available.',
+    ),
+    amount_max: amountFilter.describe(
+      'Inclusive local same-item maximum exact decimal USD; complete parent lists remain available.',
+    ),
     filing_year: year
       .min(2008)
       .optional()
@@ -122,6 +133,7 @@ export const getContributions = tool(NAME, {
     const resolved = await scope(input, ctx, NAME);
     if (resolved.record) return Output.parse(resolved.record);
     const f = resolved.filters;
+    validateAmountRange(f);
     if (typeof f.filing_year !== 'number') invalid('filing_year is required on the first call.');
     if (
       typeof f.contribution_date_after === 'string' &&
@@ -134,10 +146,7 @@ export const getContributions = tool(NAME, {
     const predicates: Record<string, string> = {};
     for (const [key, value] of Object.entries(parsed))
       if (value !== undefined) predicates[key] = value;
-    const native: Record<string, string | number | boolean> = {
-      page_size: Number(f.page_size ?? 25),
-    };
-    for (const key of [
+    const native = nativeFilters(f, [
       'filing_year',
       'filing_period',
       'registrant_id',
@@ -147,10 +156,7 @@ export const getContributions = tool(NAME, {
       'contribution_type',
       'contribution_date_after',
       'contribution_date_before',
-    ]) {
-      const value = f[key];
-      if (typeof value === 'string' || typeof value === 'number') native[key] = value;
-    }
+    ]);
     for (const key of ['contributor', 'payee', 'honoree'])
       if (typeof f[key] === 'string') native[`contribution_${key}`] = f[key];
     const upstream = source('contributions', [native]);
@@ -159,8 +165,8 @@ export const getContributions = tool(NAME, {
       scanKind: 'contributions',
       filters: f,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(input.max_pages ? { maxPages: input.max_pages } : {}),
-      provenance: provenance(f),
+      ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
+      provenance: provenance(f, input),
       source: {
         ...upstream,
         async fetchPage(...args) {
@@ -188,6 +194,7 @@ export const getContributions = tool(NAME, {
           f,
           'No LD-203 reports matched the completed scope; use uslobbying_list_reference topic contribution_types, then revise uslobbying_get_contributions.',
           stored,
+          input,
         ),
         reports: w.records,
         report_count_in_batch: w.records.length,

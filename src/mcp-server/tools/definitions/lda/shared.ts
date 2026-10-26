@@ -7,14 +7,24 @@ import {
   RecordWindowInputShape,
   RecordWindowSchema,
 } from '@/domain/contracts.js';
+import { deliveryDisclosure, normalizeDelivery } from '@/domain/delivery-limits.js';
 import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
-import { LDA_ATTRIBUTION } from '@/domain/lda.js';
+import { LDA_ATTRIBUTION, MoneySchema } from '@/domain/lda.js';
 import { resolveCheckpoint } from '@/services/acquisition/acquisition-service.js';
 import { readRecordWindow } from '@/services/acquisition/record-window.js';
 import type { DeliveryWindow } from '@/services/acquisition/types.js';
 import { getLdaService, type LdaConstantTopic, type LdaNoun } from '@/services/lda/lda-service.js';
+import { moneyToCents } from '@/services/lobbying/analysis.js';
 
 export const year = z.number().int().min(1999).max(new Date().getUTCFullYear());
+/** Trim optional text before validating its concrete grammar; blank form fields are omitted. */
+export function optionalFilter<T extends z.ZodType>(schema: T) {
+  return z.preprocess(
+    (value) => (typeof value === 'string' ? value.trim() || undefined : value),
+    schema.optional(),
+  );
+}
+export const amountFilter = optionalFilter(MoneySchema.unwrap());
 export const id = z
   .string()
   .trim()
@@ -28,18 +38,18 @@ export const commonInput = {
     .describe('Continue the original scope; other query fields may be omitted.'),
   page_size: z
     .number()
-    .int()
+    .multipleOf(1)
     .min(1)
-    .max(25)
     .optional()
-    .describe('Upstream rows per page; default 25.'),
+    .describe('Upstream rows per page; positive integers clamp to 25, default 25.'),
   max_pages: z
     .number()
-    .int()
+    .multipleOf(1)
     .min(1)
-    .max(5)
     .optional()
-    .describe('Source pages per call; default one for discovery, five for analysis.'),
+    .describe(
+      'Source pages per call; positive integers clamp to five, default one for discovery, five for analysis.',
+    ),
 };
 export const deliveryShape = {
   ...ProvenanceSchema.shape,
@@ -80,27 +90,30 @@ export const recordOutput = z.object({
 export function invalid(message: string): never {
   throw validationError(message, { reason: 'invalid_filter' });
 }
+const CONTROL_KEYS = new Set([
+  'cursor',
+  'max_pages',
+  'record_handle',
+  'record_path',
+  'record_offset',
+  'record_limit',
+]);
+const UPPERCASE_KEYS = new Set([
+  'issue_code',
+  'filing_type',
+  'client_state',
+  'client_country',
+  'foreign_entity_country',
+]);
+const LOWERCASE_KEYS = new Set(['mode', 'contribution_type']);
 export function normalize(input: object): Record<string, JsonValue> {
   const result: Record<string, JsonValue> = Object.create(null);
-  for (const [key, raw] of Object.entries(input)) {
-    if (
-      [
-        'cursor',
-        'max_pages',
-        'record_handle',
-        'record_path',
-        'record_offset',
-        'record_limit',
-      ].includes(key) ||
-      raw === undefined
-    )
-      continue;
+  for (const [key, raw] of Object.entries(normalizeDelivery(input))) {
+    if (CONTROL_KEYS.has(key) || raw === undefined) continue;
     let value: unknown = typeof raw === 'string' ? raw.trim() : raw;
     if (value === '') continue;
-    if (['issue_code', 'filing_type'].includes(key) && typeof value === 'string')
-      value = value.toUpperCase();
-    if (['mode', 'contribution_type'].includes(key) && typeof value === 'string')
-      value = value.toLowerCase();
+    if (UPPERCASE_KEYS.has(key) && typeof value === 'string') value = value.toUpperCase();
+    if (LOWERCASE_KEYS.has(key) && typeof value === 'string') value = value.toLowerCase();
     if (
       key.endsWith('_id') &&
       key !== 'canvas_id' &&
@@ -134,6 +147,8 @@ export async function scope(
   ctx: Context,
   tool: string,
 ) {
+  const disclosure = deliveryDisclosure(input);
+  input = normalizeDelivery(input);
   const supplied = normalize(input);
   if (input.record_handle) {
     if (input.cursor || input.max_pages !== undefined || Object.keys(supplied).length)
@@ -148,6 +163,7 @@ export async function scope(
         ...(input.record_limit !== undefined ? { record_limit: input.record_limit } : {}),
         buildResponse: (record_window, provenance) => ({
           ...provenance,
+          ...disclosure,
           record_window,
           retrieval_tool: tool,
           truncated: !record_window.complete,
@@ -166,7 +182,9 @@ export async function scope(
     : undefined;
   for (const [key, value] of Object.entries(supplied))
     if (stored && JSON.stringify(value) !== JSON.stringify(stored.filters[key]))
-      invalid('Continuation filters must match the original scope.');
+      throw validationError('Continuation filters must match the original scope.', {
+        reason: 'cursor_invalid',
+      });
   return { filters: stored?.filters ?? supplied, record: undefined };
 }
 /** Root output objects advertise every mode field while handlers validate exact response branches. */
@@ -176,8 +194,18 @@ export function outputObject(schemas: readonly z.ZodObject[]) {
     for (const [key, value] of Object.entries(schema.shape)) shape[key] = value.optional();
   return z.object({ ...shape, ...ProvenanceSchema.shape });
 }
-export function provenance(filters: Record<string, JsonValue>) {
+/** Reject inverted exact decimal bounds before acquisition. */
+export function validateAmountRange(filters: Record<string, JsonValue>) {
+  if (
+    typeof filters.amount_min === 'string' &&
+    typeof filters.amount_max === 'string' &&
+    moneyToCents(filters.amount_min) > moneyToCents(filters.amount_max)
+  )
+    invalid('Amount range is inverted.');
+}
+export function provenance(filters: Record<string, JsonValue>, controls: object = {}) {
   return {
+    ...deliveryDisclosure(controls),
     source: 'lda' as const,
     retrieved_at: new Date().toISOString(),
     effective_filters: filters,
@@ -190,10 +218,12 @@ export function envelope(
   filters: Record<string, JsonValue>,
   notice: string,
   stored?: Record<string, JsonValue>,
+  controls: object = {},
 ) {
   const { records: _records, ...delivery } = window;
   return {
     ...(stored ?? provenance(filters)),
+    ...deliveryDisclosure(controls),
     ...delivery,
     notices: [
       ...provenance(filters).notices,
@@ -214,6 +244,20 @@ export async function verifyCode(
   const entries = await getLdaService().constants(topic, { signal: ctx.signal });
   if (!entries.some((entry) => String(entry.value).toLowerCase() === value.toLowerCase()))
     invalid(`Unknown ${topic} value; call uslobbying_list_reference with topic ${topic}.`);
+}
+/** One upstream partition: the requested page size plus every string or numeric filter named in keys. */
+export function nativeFilters(
+  f: Record<string, JsonValue>,
+  keys: readonly string[],
+): Record<string, string | number | boolean> {
+  const native: Record<string, string | number | boolean> = {
+    page_size: Number(f.page_size ?? 25),
+  };
+  for (const key of keys) {
+    const value = f[key];
+    if (typeof value === 'string' || typeof value === 'number') native[key] = value;
+  }
+  return native;
 }
 export function source(noun: LdaNoun, partitions: Record<string, string | number | boolean>[]) {
   const service = getLdaService();
@@ -245,6 +289,11 @@ export function source(noun: LdaNoun, partitions: Record<string, string | number
       return {
         records: z.array(JsonValueSchema).parse(page.results),
         upstreamCount: page.count,
+        partition: {
+          index: cursor.partition,
+          total: partitions.length,
+          firstPage: cursor.page === 1,
+        },
         next:
           next !== null
             ? { partition: cursor.partition, page: next }

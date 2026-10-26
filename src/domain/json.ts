@@ -45,8 +45,8 @@ export const IdSchema = z
 export const SourceIdSchema = z
   .union([IdSchema, z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)])
   .describe('Lossless upstream digit string or safe nonnegative integer.');
-/** Convert only a validated source ID, preserving all digits in source strings. */
-export function normalizeSourceId(value: z.infer<typeof SourceIdSchema>): string {
+/** Validate and convert a source ID, preserving all digits in source strings; throws on any other value. */
+export function normalizeSourceId(value: unknown): string {
   return String(SourceIdSchema.parse(value));
 }
 /** Blank optional form inputs mean absent; names otherwise retain literal spelling. */

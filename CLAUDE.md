@@ -2,9 +2,9 @@
 
 **Server:** us-lobbying-mcp-server
 **Version:** 0.1.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -50,7 +50,7 @@ Read `src/mcp-server/tools/definitions/lda/search-filings.tool.ts` for the sourc
 
 Read `src/mcp-server/tools/definitions/lda/get-client-profile.tool.ts` and `lda/analytics.ts` for mode-specific validation and complete-scope analysis. Root inputs stay flat so clients can preserve every field. Requirements apply to the first call; continuation calls can omit the original filters. No resources or prompts are registered.
 
-- Resolve client names, then require caller-selected relationship IDs and explicit years. Never infer a corporate identity across relationships.
+- Resolve client names, then require caller-selected relationship IDs and explicit years. Never infer a corporate identity across relationships. Every `client_id` input and canvas column is the client record's `id`; the record's own `client_id` field is a registrant-assigned secondary number the LDA filter does not accept.
 - Acquire all versions before analytical selection; keep income and expenses separate, unknown amounts unknown, and overlapping issue buckets explicit.
 - Acquisition `coverage.complete` differs from final delivery `output_complete`. Follow every cursor and deferred record path; never drop source rows or interpret collecting results as totals.
 - `record_limit` bounds object entries/array items; strings use byte-bounded Unicode fragments. Final analytical lists are typed top-level fields with exact `row_set_totals` and `row_set_offsets`.
@@ -174,6 +174,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a published root `skills/` tree for agents using the server; absent by default |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |

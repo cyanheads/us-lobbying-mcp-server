@@ -46,11 +46,12 @@ export const dataframeQueryTool = tool('uslobbying_dataframe_query', {
       .describe('Canonical row offset for result_table, default zero.'),
     row_limit: z
       .number()
-      .int()
+      .multipleOf(1)
       .min(1)
-      .max(100)
       .default(25)
-      .describe('Maximum whole rows in this response; effective provider limit may be lower.'),
+      .describe(
+        'Maximum whole rows in this response; positive integers clamp to 100, then to any lower provider ceiling.',
+      ),
   }),
   output: QueryWindowSchema.extend({
     effective_row_limit: z
@@ -58,7 +59,9 @@ export const dataframeQueryTool = tool('uslobbying_dataframe_query', {
       .int()
       .positive()
       .optional()
-      .describe('Effective row limit when configuration lowers the requested limit.'),
+      .describe(
+        'Effective row limit when a delivery or provider ceiling lowers the requested limit.',
+      ),
   }),
   errors: [
     {

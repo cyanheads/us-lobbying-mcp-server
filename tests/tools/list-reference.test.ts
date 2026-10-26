@@ -62,6 +62,20 @@ async function invoke(input: Record<string, unknown>, tenantId = 'default') {
   return { result, data, text };
 }
 describe('reference contracts', () => {
+  it('identifies the candidate record field to select on both response surfaces', async () => {
+    const result = await invoke({ topic: 'identifiers', filter: 'client_id' });
+    expect(result.result.isError, result.text).not.toBe(true);
+    expect(result.text).toContain('candidates[].id');
+    expect(result.text).toContain('candidates[].client_id');
+    expect(result.data.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          value: 'client_id',
+          description: expect.stringContaining('candidates[].id'),
+        }),
+      ]),
+    );
+  });
   it('retrieves oversized vocabulary fields losslessly through bounded Unicode record windows', async () => {
     const name = 'é🌲'.repeat(3000);
     body = [
@@ -82,8 +96,9 @@ describe('reference contracts', () => {
       .array(z.object({ record_handle: z.string(), retrieval_tool: z.string() }))
       .parse(first.data.record_handles)[0]!;
     expect(handle.retrieval_tool).toBe('uslobbying_list_reference');
-    const root = await invoke({ record_handle: handle.record_handle });
+    const root = await invoke({ record_handle: handle.record_handle, record_limit: 26 });
     expect(root.result.isError, root.text).not.toBe(true);
+    expect(root.data.delivery_limits).toEqual({ record_limit: { requested: 26, effective: 25 } });
     expect(root.data.record_window).toMatchObject({
       kind: 'object',
       entries: expect.arrayContaining([{ key: 'name', path: '/name' }]),
@@ -173,8 +188,8 @@ describe('reference contracts', () => {
     expect(replay.data).toEqual(second.data);
     const changed = await invoke({ cursor: second.data.next_cursor, filter: 'different' });
     expect(changed.result.isError).toBe(true);
-    expect(changed.data).toMatchObject({ error: { data: { reason: 'invalid_filter' } } });
-    expect(changed.text).toContain('invalid_filter');
+    expect(changed.data).toMatchObject({ error: { data: { reason: 'cursor_invalid' } } });
+    expect(changed.text).toContain('cursor_invalid');
     const received = [...z.array(z.unknown()).parse(first.data.entries)];
     let output = second;
     for (let index = 0; index < 100; index++) {

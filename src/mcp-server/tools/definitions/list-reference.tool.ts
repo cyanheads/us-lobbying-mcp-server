@@ -9,6 +9,11 @@ import {
   RecordWindowSchema,
   SOURCE_CACHE_TTL_MS,
 } from '@/domain/contracts.js';
+import {
+  DeliveryLimitsSchema,
+  deliveryDisclosure,
+  normalizeDelivery,
+} from '@/domain/delivery-limits.js';
 import { formatResult } from '@/domain/format.js';
 import { JsonValueSchema, optionalText } from '@/domain/json.js';
 import { resolveCheckpoint, serveResults } from '@/services/acquisition/acquisition-service.js';
@@ -16,6 +21,7 @@ import { readRecordWindow } from '@/services/acquisition/record-window.js';
 import { getFaraService } from '@/services/fara/fara-service.js';
 import { getLdaService } from '@/services/lda/lda-service.js';
 
+const NAME = 'uslobbying_list_reference';
 const Topic = z.enum([
   'issue_codes',
   'filing_types',
@@ -35,6 +41,7 @@ const Entry = z
   })
   .describe('One attributed vocabulary entry or methodology explanation.');
 const Output = z.object({
+  delivery_limits: DeliveryLimitsSchema,
   topic: Topic.describe('Requested vocabulary.'),
   entries: z
     .array(Entry)
@@ -81,7 +88,7 @@ const Output = z.object({
     'Exact recursive window of a deferred vocabulary entry.',
   ),
   retrieval_tool: z
-    .literal('uslobbying_list_reference')
+    .literal(NAME)
     .optional()
     .describe('Tool used to retrieve deferred vocabulary entries.'),
 });
@@ -97,7 +104,7 @@ const authored: Record<string, Entries> = {
       name: 'Client relationship ID',
       source: 'methodology',
       description:
-        'A digit string identifying a client relationship with a registrant, not a verified corporate identity across retained firms. Resolve names, then select IDs explicitly.',
+        'A digit string identifying a client relationship with a registrant, not a verified corporate identity across retained firms. Resolve names with uslobbying_get_client_profile, then select candidates[].id for client_id or client_ids inputs. candidates[].client_id is a secondary source number, not the record ID to select. Zero source rows do not establish whether an identifier is valid.',
     },
     {
       value: 'registrant_id',
@@ -117,7 +124,7 @@ const authored: Record<string, Entries> = {
       name: 'Filing UUID',
       source: 'methodology',
       description:
-        'Originals and amendments have distinct UUIDs. UUID order does not establish legal amendment lineage.',
+        'Pass a filing_uuid from lobbyist evidence or analytical selections to uslobbying_search_filings for the complete filing. Originals and amendments have distinct UUIDs; UUID order does not establish legal amendment lineage.',
     },
     {
       value: 'registration_number',
@@ -216,7 +223,7 @@ const authored: Record<string, Entries> = {
   ],
 };
 /** Decode reference codes before querying and inspect source accounting limitations. */
-export const listReference = tool('uslobbying_list_reference', {
+export const listReference = tool(NAME, {
   description:
     'List official issue codes, filing types, government entities, contribution types and countries, or explain identifiers, methodology and FARA rules. Optional filter performs case-insensitive literal token-AND matching across the complete vocabulary. Follow next_cursor for pinned result windows; retrieve oversized entries with this tool using record_handle and record_path. Countries include separately attributed LDA codes and FARA source labels; FARA labels are not guessed ISO codes.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -291,6 +298,8 @@ export const listReference = tool('uslobbying_list_reference', {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
+    const disclosure = deliveryDisclosure(input);
+    input = normalizeDelivery(input);
     const filter = optionalText(input.filter)?.toLowerCase().split(/\s+/).join(' ');
     const filters = { ...(input.topic && { topic: input.topic }), ...(filter && { filter }) };
     if (input.record_handle) {
@@ -302,22 +311,28 @@ export const listReference = tool('uslobbying_list_reference', {
       return Output.parse(
         await readRecordWindow(ctx, {
           ...input,
-          tool: 'uslobbying_list_reference',
+          tool: NAME,
           record_handle: input.record_handle,
+          buildResponse: (record_window, provenance) => ({
+            ...provenance,
+            ...disclosure,
+            record_window,
+            truncated: !record_window.complete,
+          }),
         }),
       );
     }
     if (input.record_path !== '' || input.record_offset !== 0 || input.record_limit !== 25)
       throw ctx.fail('invalid_filter', 'Record selectors require record_handle.');
     const checkpoint = input.cursor
-      ? await resolveCheckpoint(ctx, { tool: 'uslobbying_list_reference', cursor: input.cursor })
+      ? await resolveCheckpoint(ctx, { tool: NAME, cursor: input.cursor })
       : undefined;
     const topic = Topic.optional().parse(checkpoint?.filters.topic ?? input.topic);
     if (!topic)
       throw ctx.fail('invalid_filter', 'topic is required to start a vocabulary request.');
     const deliver = async (records?: Entries, provenance = checkpoint?.provenance ?? {}) => {
       const result = await serveResults(ctx, {
-        tool: 'uslobbying_list_reference',
+        tool: NAME,
         scanKind: 'reference',
         filters,
         provenance,
@@ -327,6 +342,7 @@ export const listReference = tool('uslobbying_list_reference', {
         identify: (record) => createHash('sha256').update(JSON.stringify(record)).digest('hex'),
         buildResponse: (window, _metadata, stored) => ({
           ...stored,
+          ...disclosure,
           entries: window.records,
           ...(window.next_cursor && { next_cursor: window.next_cursor }),
           output_complete: window.output_complete,
@@ -404,7 +420,7 @@ export const listReference = tool('uslobbying_list_reference', {
         : [
             'No reference entries matched; call uslobbying_list_reference with the same topic and omit filter.',
           ],
-      retrieval_tool: 'uslobbying_list_reference',
+      retrieval_tool: NAME,
     });
   },
   format: formatResult,

@@ -34,6 +34,19 @@ export const ManifestSchema = z.object({
   cursor: z.string(),
   expires: z.number().int(),
   coverage: CoverageSchema,
+  partitions: z
+    .object({
+      total: z.number().int().positive(),
+      observed: z.record(
+        z.string(),
+        z.object({
+          count: z.number().int().nonnegative().optional(),
+          recordsFetched: z.number().int().nonnegative(),
+          completeHistory: z.boolean(),
+        }),
+      ),
+    })
+    .optional(),
   position: JsonValueSchema,
   positions: z.array(z.string()),
   chunks: z.array(z.string()),
