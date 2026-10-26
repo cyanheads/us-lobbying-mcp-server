@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "us-lobbying-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Search US lobbying disclosures and foreign-agent registrations via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
