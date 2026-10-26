@@ -6,10 +6,18 @@
   "author": "Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)",
   "homepage": "https://github.com/cyanheads/us-lobbying-mcp-server#readme",
   "funding": [
-    { "type": "github", "url": "https://github.com/sponsors/cyanheads" },
-    { "type": "buy_me_a_coffee", "url": "https://www.buymeacoffee.com/cyanheads" }
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/cyanheads"
+    },
+    {
+      "type": "buy_me_a_coffee",
+      "url": "https://www.buymeacoffee.com/cyanheads"
+    }
   ],
-  "bugs": { "url": "https://github.com/cyanheads/us-lobbying-mcp-server/issues" },
+  "bugs": {
+    "url": "https://github.com/cyanheads/us-lobbying-mcp-server/issues"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,6 +25,7 @@
     "us-lobbying-mcp-server": "dist/index.js"
   },
   "files": [
+    "skills/",
     "changelog/",
     "dist/",
     "!dist/*.mcpb",
@@ -59,6 +68,10 @@
     "lda",
     "fara",
     "disclosures",
+    "lobbying-disclosure",
+    "foreign-agents",
+    "government-transparency",
+    "open-data",
     "ai-agents",
     "ai-tools",
     "typescript",
@@ -81,8 +94,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.13.16",
-    "@duckdb/node-api": "^1.5.6-r.2",
+    "@cyanheads/mcp-ts-core": "^0.13.18",
+    "@duckdb/node-api": "^2.0.0-r.1",
     "fast-xml-parser": "^5.11.2",
     "fast-xml-validator": "^1.4.2",
     "fflate": "^0.8.3",
@@ -90,13 +103,13 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.2",
+    "@biomejs/biome": "2.6.3",
     "@socketsecurity/bun-security-scanner": "^1.1.3",
     "@types/node": "26.6.5",
     "@vitest/coverage-istanbul": "5.0.5",
     "depcheck": "^1.4.7",
     "fast-check": "^4.10.2",
-    "ignore": "^7.0.13",
+    "ignore": "^7.0.14",
     "tsc-alias": "^1.9.9",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
