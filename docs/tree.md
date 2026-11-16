@@ -1,6 +1,6 @@
 # us-lobbying-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 03:43:50
+Generated on: 2026-11-16 01:49:33
 
 ```text
 us-lobbying-mcp-server/
@@ -25,6 +25,7 @@ us-lobbying-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -139,6 +140,9 @@ us-lobbying-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── us-lobbying-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   ├── server-config.ts
@@ -173,7 +177,6 @@ us-lobbying-mcp-server/
 │   ├── services/
 │   │   ├── acquisition/
 │   │   │   ├── acquisition-service.ts
-│   │   │   ├── record-window.ts
 │   │   │   ├── storage.ts
 │   │   │   └── types.ts
 │   │   ├── canvas/
@@ -184,13 +187,15 @@ us-lobbying-mcp-server/
 │   │   │   └── types.ts
 │   │   ├── lda/
 │   │   │   └── lda-service.ts
-│   │   └── lobbying/
-│   │       └── analysis.ts
+│   │   ├── lobbying/
+│   │   │   └── analysis.ts
+│   │   └── single-flight.ts
 │   └── index.ts
 ├── tests/
 │   ├── config/
 │   │   └── server-config.test.ts
 │   ├── domain/
+│   │   ├── delivery-limits.test.ts
 │   │   ├── format.test.ts
 │   │   └── json.test.ts
 │   ├── fuzz/
@@ -201,8 +206,7 @@ us-lobbying-mcp-server/
 │   │   └── clean-mcpb.test.ts
 │   ├── services/
 │   │   ├── acquisition/
-│   │   │   ├── acquisition-service.test.ts
-│   │   │   └── record-window.test.ts
+│   │   │   └── acquisition-service.test.ts
 │   │   ├── canvas/
 │   │   │   ├── canvas-service.test.ts
 │   │   │   └── fixture.ts
@@ -217,7 +221,12 @@ us-lobbying-mcp-server/
 │   └── tools/
 │       ├── lda/
 │       │   ├── analytical-canvas.test.ts
-│       │   └── contracts.test.ts
+│       │   ├── analytics-wiring.test.ts
+│       │   ├── contracts.test.ts
+│       │   ├── delivery.test.ts
+│       │   ├── filter-codes.test.ts
+│       │   ├── harness.ts
+│       │   └── shared.test.ts
 │       ├── dataframe.test.ts
 │       ├── list-reference.test.ts
 │       └── search-foreign-agents.test.ts
@@ -231,6 +240,7 @@ us-lobbying-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
