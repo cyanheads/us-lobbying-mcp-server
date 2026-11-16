@@ -1,6 +1,4 @@
 .env*
-.DS_Store
-**/.DS_Store
 .mcpregistry_*
 /.claude/
 /.agents/
