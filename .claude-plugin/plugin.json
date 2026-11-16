@@ -28,6 +28,13 @@
       "required": false,
       "default": false
     },
+    "USLOBBYING_CLAMP_LIMITS": {
+      "title": "Clamp over-cap counts",
+      "description": "Clamp an over-cap page_size, max_pages or row_limit to its ceiling and disclose it; turn off to reject such values instead.",
+      "type": "boolean",
+      "required": false,
+      "default": true
+    },
     "CANVAS_PROVIDER_TYPE": {
       "title": "SQL canvas provider",
       "description": "Set duckdb to enable local SQL; none keeps complete inline analytical delivery.",
@@ -44,6 +51,7 @@
         "MCP_TRANSPORT_TYPE": "stdio",
         "USLOBBYING_LDA_API_KEY": "${user_config.USLOBBYING_LDA_API_KEY}",
         "USLOBBYING_DATAFRAME_DROP_ENABLED": "${user_config.USLOBBYING_DATAFRAME_DROP_ENABLED}",
+        "USLOBBYING_CLAMP_LIMITS": "${user_config.USLOBBYING_CLAMP_LIMITS}",
         "CANVAS_PROVIDER_TYPE": "${user_config.CANVAS_PROVIDER_TYPE}"
       }
     }

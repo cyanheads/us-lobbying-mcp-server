@@ -1,6 +1,7 @@
 /** @fileoverview Real LDA transport contracts with a strict network boundary. @module tests/services/lda/lda-service */
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SOURCE_CACHE_TTL_MS } from '../../../src/domain/contracts.js';
 import { formatResult } from '../../../src/domain/format.js';
 import { LdaService } from '../../../src/services/lda/lda-service.js';
 
@@ -149,7 +150,7 @@ describe('LDA noun wiring', () => {
       contribution_types: 'contribution/itemtypes',
     } as const;
     for (const topic of Object.keys(paths) as (keyof typeof paths)[])
-      expect(await settle(service.constants(topic))).toEqual([
+      expect((await settle(service.constants(topic))).entries).toEqual([
         topic === 'government_entities'
           ? { id: '211', value: '211', name: 'Synthetic board', extra: null }
           : { value: 'TEC', name: 'Synthetic label', extra: null },
@@ -166,7 +167,7 @@ describe('LDA noun wiring', () => {
           throw new Error(`Unmatched ${url}`);
         return Response.json([{ id, name: 'Synthetic board', future: { nested: [null, false] } }]);
       });
-      expect(await settle(service.constants('government_entities'))).toEqual([
+      expect((await settle(service.constants('government_entities'))).entries).toEqual([
         {
           id: String(id),
           value: String(id),
@@ -424,5 +425,165 @@ describe('transport failures and shared budget', () => {
     queuedController.abort(reason);
     expect(await queued).toBe(reason);
     expect(next.calls).toHaveLength(1);
+  });
+});
+
+describe('constants cache', () => {
+  const countries = [
+    { value: 'US', name: 'United States' },
+    { value: 'XK', name: 'Kosovo' },
+  ];
+  const states = [{ value: 'WA', name: 'Washington' }];
+  const reason = new DOMException('Synthetic caller cancellation', 'AbortError');
+  /** A response that never arrives; the exchange rejects only when its own signal aborts. */
+  const held = (init: RequestInit | undefined) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+  it('serves a topic from the instance cache for 24 hours, then refetches', async () => {
+    let body: unknown = countries;
+    const { service, calls } = source(() => Response.json(body));
+    expect((await settle(service.constants('countries'))).entries).toEqual(countries);
+    const fetchedAt = calls[0]!.at;
+    body = [{ value: 'NEW', name: 'New vocabulary' }];
+    vi.setSystemTime(fetchedAt + SOURCE_CACHE_TTL_MS - 1);
+    expect((await settle(service.constants('countries'))).entries).toEqual(countries);
+    expect(calls).toHaveLength(1);
+    vi.setSystemTime(fetchedAt + SOURCE_CACHE_TTL_MS);
+    expect((await settle(service.constants('countries'))).entries).toEqual(body);
+    expect(calls).toHaveLength(2);
+  });
+  it('reports the fetch instant as retrieved_at on cache hits and a new instant after refetch', async () => {
+    const { service, calls } = source(() => Response.json(countries));
+    const fetched = await settle(service.constants('countries'));
+    expect(fetched).toEqual({
+      entries: countries,
+      retrieved_at: new Date(calls[0]!.at).toISOString(),
+    });
+    vi.setSystemTime(calls[0]!.at + 60_000);
+    const hit = await settle(service.constants('countries'));
+    expect(hit.retrieved_at).toBe(fetched.retrieved_at);
+    expect(hit.entries).toBe(fetched.entries);
+    vi.setSystemTime(calls[0]!.at + SOURCE_CACHE_TTL_MS);
+    const refetched = await settle(service.constants('countries'));
+    expect(calls).toHaveLength(2);
+    expect(refetched.retrieved_at).toBe(new Date(calls[1]!.at).toISOString());
+    expect(refetched.retrieved_at).not.toBe(fetched.retrieved_at);
+  });
+  it('shares one request among concurrent misses and caches each topic separately', async () => {
+    const { service, calls } = source((url) =>
+      Response.json(url.pathname.includes('/states/') ? states : countries),
+    );
+    const results = await settle(
+      Promise.all([
+        service.constants('countries'),
+        service.constants('countries'),
+        service.constants('states'),
+      ]),
+    );
+    expect(results.map((result) => result.entries)).toEqual([countries, countries, states]);
+    expect(results[1]).toBe(results[0]);
+    expect((await settle(service.constants('states'))).entries).toEqual(states);
+    expect(calls.map((call) => call.url.pathname)).toEqual([
+      '/api/v1/constants/general/countries/',
+      '/api/v1/constants/general/states/',
+    ]);
+  });
+  it('starts every service instance with an empty cache', async () => {
+    const first = source(() => Response.json(countries));
+    await settle(first.service.constants('countries'));
+    const second = new LdaService({ fetch: first.fetcher });
+    services.push(second);
+    expect((await settle(second.constants('countries'))).entries).toEqual(countries);
+    expect(first.calls).toHaveLength(2);
+  });
+  it.each([
+    [
+      'an upstream failure',
+      () => new Response('unavailable', { status: 503 }),
+      'The official LDA request failed. (failed after 2 attempts)',
+      { code: JsonRpcErrorCode.ServiceUnavailable, data: { status: 503, retryable: true } },
+      2,
+    ],
+    [
+      'a schema-invalid response',
+      () => Response.json([{ value: 'US' }]),
+      'LDA returned an incompatible source schema.',
+      {
+        code: JsonRpcErrorCode.SerializationError,
+        data: { reason: 'source_schema_changed', retryable: false },
+      },
+      1,
+    ],
+  ] as const)(
+    'never caches %s and surfaces its own error',
+    async (_label, failure, message, error, attempts) => {
+      let failing = true;
+      const { service, calls } = source(() => (failing ? failure() : Response.json(countries)));
+      const outcomes = await settle(
+        Promise.allSettled([service.constants('countries'), service.constants('countries')]),
+      );
+      for (const outcome of outcomes) {
+        expect(outcome.status).toBe('rejected');
+        if (outcome.status !== 'rejected') continue;
+        expect(outcome.reason).toMatchObject(error);
+        expect(outcome.reason.message).toBe(message);
+      }
+      expect(calls).toHaveLength(attempts);
+      failing = false;
+      expect((await settle(service.constants('countries'))).entries).toEqual(countries);
+      expect(calls).toHaveLength(attempts + 1);
+    },
+  );
+  it('lets one waiter cancel without failing the shared request', async () => {
+    let release: ((response: Response) => void) | undefined;
+    const { service, calls } = source(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const controller = new AbortController();
+    const cancelled = service
+      .constants('countries', { signal: controller.signal })
+      .catch((error) => error);
+    const retained = service.constants('countries', { signal: new AbortController().signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toHaveLength(1);
+    controller.abort(reason);
+    expect(await cancelled).toBe(reason);
+    expect(calls[0]?.init?.signal?.aborted).toBe(false);
+    release?.(Response.json(countries));
+    expect((await settle(retained)).entries).toEqual(countries);
+    expect((await settle(service.constants('countries'))).entries).toEqual(countries);
+    expect(calls).toHaveLength(1);
+  });
+  it('aborts the request when its last waiter cancels and caches nothing', async () => {
+    let hold = true;
+    const { service, calls } = source((_url, init) =>
+      hold ? held(init) : Response.json(countries),
+    );
+    const controller = new AbortController();
+    const pending = service
+      .constants('countries', { signal: controller.signal })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(reason);
+    expect(await pending).toBe(reason);
+    expect(calls[0]?.init?.signal?.aborted).toBe(true);
+    hold = false;
+    expect((await settle(service.constants('countries'))).entries).toEqual(countries);
+    expect(calls).toHaveLength(2);
+  });
+  it('rejects an already-cancelled caller without a request or a cache read', async () => {
+    const { service, calls } = source(() => Response.json(countries));
+    await settle(service.constants('countries'));
+    const controller = new AbortController();
+    controller.abort(reason);
+    await expect(service.constants('states', { signal: controller.signal })).rejects.toBe(reason);
+    await expect(service.constants('countries', { signal: controller.signal })).rejects.toBe(
+      reason,
+    );
+    expect(calls).toHaveLength(1);
   });
 });

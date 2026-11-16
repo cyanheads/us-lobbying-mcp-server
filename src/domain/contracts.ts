@@ -3,13 +3,11 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { DeliveryLimitsSchema } from './delivery-limits.js';
 import { type JsonValue, JsonValueSchema } from './json.js';
 
-/** Full serialized MCP result target, including both surfaces and envelope allowance. */
-export const FULL_RESULT_TARGET_BYTES = 24_000;
 /** Maximum duration of one tool call, including queueing and retries. */
 export const TOOL_DEADLINE_MS = 45_000;
 /** Maximum single network exchange, bounded further by the remaining tool deadline. */
 export const EXCHANGE_DEADLINE_MS = 20_000;
-/** Common absolute lifetime of scans, chunks and deferred records. */
+/** Common absolute lifetime of scans, their retained and final chunks, and replay state. */
 export const ACQUISITION_TTL_MS = 86_400_000;
 /** Default-provider retained acquisition bytes, including indexes and replay state. */
 export const ACQUISITION_MEMORY_LIMIT_BYTES = 128 * 1024 * 1024;
@@ -48,104 +46,6 @@ export const ProvenanceSchema = z.object({
   snapshot_source_urls: z.array(z.string()).optional().describe('Official snapshot URLs.'),
   snapshot_last_modified: z.string().optional().describe('Upstream Last-Modified header.'),
 });
-/** Shared selectors; handlers enforce exclusivity against filters/cursor/canvas. */
-export const RecordWindowInputShape = {
-  record_handle: z.string().optional().describe('Tenant/tool-bound deferred record handle.'),
-  record_path: z
-    .string()
-    .default('')
-    .describe('JSON Pointer to a stored value; empty selects the root.'),
-  record_offset: z
-    .number()
-    .int()
-    .nonnegative()
-    .default(0)
-    .describe('Key, item or Unicode-code-point offset.'),
-  record_limit: z
-    .number()
-    .multipleOf(1)
-    .min(1)
-    .default(25)
-    .describe(
-      'Maximum object entries or array items, clamped to 25; text fragments use the response byte budget.',
-    ),
-};
-/** A deferred parent is not counted as a delivered full record. */
-export const RecordHandleSchema = z
-  .object({
-    record_handle: z.string().describe('Opaque retained parent handle.'),
-    source_id: z.string().describe('Original source identity.'),
-    record_bytes: z.number().int().nonnegative().describe('Serialized parent UTF-8 bytes.'),
-    expires_at: z.string().describe('Retained parent expiry ISO timestamp.'),
-    retrieval_tool: z.string().describe('Source tool for record windows.'),
-  })
-  .describe('Deferred parent retrieval.');
-const windowBase = {
-  record_handle: z.string().describe('Stored parent handle.'),
-  path: z.string().describe('Selected JSON Pointer.'),
-  total: z.number().int().nonnegative().describe('Total keys, items or code points at this path.'),
-  offset: z.number().int().nonnegative().describe('Start position.'),
-  returned: z.number().int().nonnegative().describe('Delivered entries or code points.'),
-  next_offset: z.number().int().nonnegative().optional().describe('Next undelivered position.'),
-  complete: z.boolean().describe('This path and included children are fully delivered.'),
-};
-/** Discriminated windows preserve parent membership and oversized-child descent paths. */
-export const RecordWindowSchema = z.discriminatedUnion('kind', [
-  z
-    .object({
-      ...windowBase,
-      kind: z.literal('object').describe('Object-entry window.'),
-      entries: z
-        .array(
-          z
-            .object({
-              key: z.string().describe('Original key.'),
-              path: z.string().describe('Child JSON Pointer.'),
-              value: JsonValueSchema.optional().describe('Whole child value only when it fits.'),
-            })
-            .describe('Key and pointer; value only when it fits.'),
-        )
-        .describe('Key-ordered object window.'),
-    })
-    .describe('Complete or deferred object children.'),
-  z
-    .object({
-      ...windowBase,
-      kind: z.literal('array').describe('Array-item window.'),
-      items: z
-        .array(
-          z
-            .object({
-              index: z.number().int().nonnegative().describe('Original child index.'),
-              path: z.string().describe('Child JSON Pointer.'),
-              value: JsonValueSchema.optional().describe('Whole child value only when it fits.'),
-            })
-            .describe('Original index and child pointer.'),
-        )
-        .describe('Indexed array window.'),
-    })
-    .describe('Array items preserving original indexes.'),
-  z
-    .object({
-      ...windowBase,
-      kind: z.literal('string').describe('Unicode text window.'),
-      text: z.string().describe('Complete-code-point text fragment.'),
-    })
-    .describe('Unicode-code-point text fragment.'),
-  z
-    .object({
-      ...windowBase,
-      kind: z.literal('scalar').describe('Complete scalar value.'),
-      value: z
-        .union([
-          z.null().describe('Null value.'),
-          z.boolean().describe('Boolean value.'),
-          z.number().finite().describe('Finite numeric value.'),
-        ])
-        .describe('Exact scalar value.'),
-    })
-    .describe('Unfragmented non-text scalar.'),
-]);
 /** Every canvas-token response carries these consumer-facing routing pointers. */
 export const CanvasPointersShape = {
   canvas_id: z.string().describe('Tenant-scoped canvas access token.'),
@@ -194,11 +94,21 @@ export const QueryWindowSchema = z.object({
   rows: z.array(z.record(z.string(), JsonValueSchema)).describe('Whole JSON-safe rows.'),
   row_count: z.number().int().nonnegative().describe('Exact materialized result count.'),
   rows_returned: z.number().int().nonnegative().describe('Rows actually delivered.'),
-  offset: z.number().int().nonnegative().describe('Canonical-order starting row offset.'),
+  offset: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe(
+      'Starting row offset in the materialized SQL result order, which a top-level ORDER BY sets; an ORDER BY only inside a CTE or subquery does not guarantee it.',
+    ),
   next_offset: z.number().int().nonnegative().optional().describe('Next undelivered row offset.'),
   output_complete: z.boolean().describe('Whether this result has no remaining delivery rows.'),
   truncated: z.boolean().describe('More materialized rows remain; continue with next_offset.'),
-  row_order: z.literal('canonical_values').describe('Delivery orders by all materialized values.'),
+  row_order: z
+    .literal('sql_result')
+    .describe(
+      'Rows follow the materialized SQL result order set by a top-level ORDER BY; an ORDER BY only inside a CTE or subquery does not guarantee it, and without one the order is fixed once materialized.',
+    ),
 });
 /** Validated progress shared by acquisition and source adapters. */
 export type Coverage = z.infer<typeof CoverageSchema>;

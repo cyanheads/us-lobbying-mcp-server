@@ -38,14 +38,6 @@ export const dataframeDescribeTool = tool('uslobbying_dataframe_describe', {
   }),
   errors: [
     {
-      reason: 'query_row_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'Complete table metadata exceeds the result byte budget.',
-      recovery:
-        'Inspect a single table with table_name, or use uslobbying_dataframe_query to materialize a narrower SELECT with shorter SQL.',
-    },
-    {
       reason: 'canvas_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       thrownBy: 'service',

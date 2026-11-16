@@ -13,6 +13,10 @@ const ServerConfigSchema = z.object({
     .stringbool()
     .default(false)
     .describe('Enable deletion of staged dataframe tables.'),
+  clampLimits: z
+    .stringbool()
+    .default(true)
+    .describe('Clamp over-cap count controls to their ceiling; false rejects them.'),
 });
 
 /** Validated configuration kept separate from framework configuration. */
@@ -24,6 +28,7 @@ export function getServerConfig(): ServerConfig {
   config ??= parseEnvConfig(ServerConfigSchema, {
     ldaApiKey: 'USLOBBYING_LDA_API_KEY',
     dataframeDropEnabled: 'USLOBBYING_DATAFRAME_DROP_ENABLED',
+    clampLimits: 'USLOBBYING_CLAMP_LIMITS',
   });
   return config;
 }

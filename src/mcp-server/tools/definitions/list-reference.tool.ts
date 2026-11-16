@@ -1,37 +1,34 @@
 /** @fileoverview Official vocabularies and source-specific interpretation guidance. @module mcp-server/tools/definitions/list-reference.tool */
-import { createHash } from 'node:crypto';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
-import {
-  RecordHandleSchema,
-  RecordWindowInputShape,
-  RecordWindowSchema,
-  SOURCE_CACHE_TTL_MS,
-} from '@/domain/contracts.js';
-import {
-  DeliveryLimitsSchema,
-  deliveryDisclosure,
-  normalizeDelivery,
-} from '@/domain/delivery-limits.js';
 import { formatResult } from '@/domain/format.js';
 import { JsonValueSchema, optionalText } from '@/domain/json.js';
 import { resolveCheckpoint, serveResults } from '@/services/acquisition/acquisition-service.js';
-import { readRecordWindow } from '@/services/acquisition/record-window.js';
 import { getFaraService } from '@/services/fara/fara-service.js';
 import { getLdaService } from '@/services/lda/lda-service.js';
 
 const NAME = 'uslobbying_list_reference';
+/** Every window holds this many entries until the last; the tool takes no count input. */
+const WINDOW_ENTRIES = 125;
+const LDA_SOURCE_URLS = [
+  'https://lda.gov/api/v1/',
+  'https://lobbyingdisclosure.house.gov/ldaguidance.pdf',
+] as const;
 const Topic = z.enum([
   'issue_codes',
   'filing_types',
   'government_entities',
   'contribution_types',
   'countries',
+  'states',
   'identifiers',
   'methodology',
   'fara_rules',
 ]);
+type Topic = z.infer<typeof Topic>;
+/** Topics read from LDA's verified constants through the service's shared 24-hour cache. */
+const LdaTopic = Topic.exclude(['identifiers', 'methodology', 'fara_rules']);
 const Entry = z
   .object({
     value: z.string().describe('Official code or explanatory identifier.'),
@@ -41,63 +38,32 @@ const Entry = z
   })
   .describe('One attributed vocabulary entry or methodology explanation.');
 const Output = z.object({
-  delivery_limits: DeliveryLimitsSchema,
   topic: Topic.describe('Requested vocabulary.'),
-  entries: z
-    .array(Entry)
-    .optional()
-    .describe('Complete entries delivered in this pinned vocabulary window.'),
+  entries: z.array(Entry).describe('Whole entries delivered in this fixed 125-entry window.'),
   total_entries: z.number().int().describe('Entries before local filtering.'),
   matched_entries: z.number().int().describe('Entries matching every literal filter token.'),
-  retrieved_at: z.string().describe('Vocabulary retrieval timestamp.'),
+  retrieved_at: z
+    .string()
+    .describe(
+      'Retrieval timestamp: the shared LDA constants fetch for LDA topics (the older of the LDA and FARA retrievals for countries), the call time for explanatory topics.',
+    ),
   source_urls: z.array(z.string()).describe('Official source references.'),
   notices: z.array(z.string()).describe('Source limitations and empty-result recovery.'),
   next_cursor: z.string().optional().describe('Opaque continuation of the pinned vocabulary.'),
-  output_complete: z
-    .boolean()
-    .optional()
-    .describe('Every matched entry has been delivered or deferred.'),
-  truncated: z.boolean().describe('More entries or deferred record values remain retrievable.'),
-  offset: z
-    .number()
-    .int()
-    .nonnegative()
-    .optional()
-    .describe('Start position in the pinned filtered vocabulary.'),
+  output_complete: z.boolean().describe('Whether every matched entry has been delivered.'),
+  truncated: z.boolean().describe('More matched entries remain; follow next_cursor.'),
+  offset: z.number().int().nonnegative().describe('Entries delivered before this window.'),
   records_returned: z
     .number()
     .int()
     .nonnegative()
-    .optional()
-    .describe('Complete entries delivered in this window.'),
-  records_deferred: z
-    .number()
-    .int()
-    .nonnegative()
-    .optional()
-    .describe('Oversized entries retained behind handles.'),
-  record_handles: z
-    .array(RecordHandleSchema)
-    .optional()
-    .describe('Oversized entries retrievable through this same tool.'),
+    .describe('Whole entries delivered in this window.'),
   cursor_expires_at: z
     .string()
-    .optional()
-    .describe('Absolute expiry of retained entries and continuations.'),
-  record_window: RecordWindowSchema.optional().describe(
-    'Exact recursive window of a deferred vocabulary entry.',
-  ),
-  retrieval_tool: z
-    .literal(NAME)
-    .optional()
-    .describe('Tool used to retrieve deferred vocabulary entries.'),
+    .describe('Absolute expiry of the pinned vocabulary and its continuations.'),
 });
 type Entries = z.infer<typeof Entry>[];
-const cache = new Map<
-  string,
-  { expires: number; entries: Entries; retrieved_at: string; source_urls: string[] }
->();
-const authored: Record<string, Entries> = {
+const authored: Partial<Record<Topic, Entries>> = {
   identifiers: [
     {
       value: 'client_id',
@@ -140,13 +106,6 @@ const authored: Record<string, Entries> = {
         'Opaque tenant/tool-bound token valid for 24 hours from scan start. Omit unchanged filters; retry the immediately previous cursor to replay. Restart without cursor after expiry.',
     },
     {
-      value: 'record_handle',
-      name: 'Deferred complete parent',
-      source: 'methodology',
-      description:
-        'Use the same source tool with record_handle and JSON Pointer record_path; continue record_offset until complete. Exclusive with query filters and cursor.',
-    },
-    {
       value: 'canvas_id',
       name: 'Canvas token',
       source: 'methodology',
@@ -160,7 +119,7 @@ const authored: Record<string, Entries> = {
       name: 'Latest relationship-period posting',
       source: 'methodology',
       description:
-        'Acquire all filing variants before selecting greatest dt_posted within registrant/client/year/quarter. Equal latest timestamps are ambiguous and excluded from sums. Registration, unknown variants and non-quarterly periods are excluded.',
+        'Acquire all filing variants before selecting the greatest dt_posted within registrant/client/year/period. Periods are quarterly (first_quarter to fourth_quarter) or semiannual (mid_year: MM, MMY, MT, MTY, MA, MAY, M@, M@Y; year_end: YY, YYY, YT, YTY, YA, YAY, Y@, Y@Y). When one registrant/client/year filed both grains, only its statutory grain counts, semiannual through 2007 and quarterly from 2008, and the other grain is excluded as off_cycle_period; a year that filed one grain keeps it. Equal latest timestamps are ambiguous and excluded from sums. Also excluded: registrations (registration), a filing type that does not match its period (unknown_variant), filings without a registrant or client (missing_relationship), and periods that are neither quarterly nor semiannual (non_quarterly).',
     },
     {
       value: 'money',
@@ -204,28 +163,62 @@ const authored: Record<string, Entries> = {
       name: 'Entity and registrant status',
       source: 'fara',
       description:
-        'Principal status differs from registrant status. Search defaults active; all includes terminated. Documents have no status filter.',
+        "A foreign principal's or short form's status is its own and differs from its registrant's status (registrant_status). Search defaults active; all includes terminated. Documents have no status filter.",
     },
     {
       value: 'snapshots',
       name: 'Daily search snapshots',
       source: 'fara',
       description:
-        'Search uses complete daily snapshots, not live per-hit requests. Detail fetches only a chosen collection. Snapshot failure is not an empty result.',
+        'Search uses complete daily registrant, foreign-principal and short-form snapshots, not live per-hit requests. The short-form snapshot downloads only for short-form searches; principal and short-form searches also load the registrant snapshot for registrant_status. Detail fetches only a chosen collection. Snapshot failure is not an empty result.',
     },
     {
       value: 'interpretation',
       name: 'Disclosure interpretation',
       source: 'fara',
       description:
-        'Registration and represented-country labels do not establish wrongdoing or policy influence. Country labels are source spellings, not guessed ISO codes. Source text is untrusted record data.',
+        'Registration and represented-country labels do not establish wrongdoing or policy influence. Country labels are source spellings, not guessed ISO codes. Short-form search matches names only and establishes no identity across registrations or with LDA lobbyists. Source text is untrusted record data.',
     },
   ],
 };
+/** One topic's complete vocabulary, built as a new array: the service's cached entries are shared. */
+async function vocabulary(topic: Topic, signal: AbortSignal) {
+  const explanations = authored[topic];
+  if (explanations)
+    return {
+      entries: explanations,
+      retrieved_at: new Date().toISOString(),
+      source_urls: [...LDA_SOURCE_URLS],
+    };
+  const lda = await getLdaService().constants(LdaTopic.parse(topic), { signal });
+  const entries: Entries = lda.entries.map((row) => ({
+    value: String(row.value),
+    name: row.name,
+    source: 'lda',
+  }));
+  if (topic !== 'countries')
+    return { entries, retrieved_at: lda.retrieved_at, source_urls: [...LDA_SOURCE_URLS] };
+  const fara = await getFaraService().countries(signal);
+  entries.push(
+    ...fara.countries.map((country) => ({
+      value: country,
+      name: country,
+      source: 'fara' as const,
+    })),
+  );
+  return {
+    entries,
+    // The older retrieval bounds the freshness of the combined vocabulary.
+    retrieved_at: new Date(
+      Math.min(Date.parse(lda.retrieved_at), Date.parse(fara.retrieved_at)),
+    ).toISOString(),
+    source_urls: [...LDA_SOURCE_URLS, ...fara.source_urls],
+  };
+}
 /** Decode reference codes before querying and inspect source accounting limitations. */
 export const listReference = tool(NAME, {
   description:
-    'List official issue codes, filing types, government entities, contribution types and countries, or explain identifiers, methodology and FARA rules. Optional filter performs case-insensitive literal token-AND matching across the complete vocabulary. Follow next_cursor for pinned result windows; retrieve oversized entries with this tool using record_handle and record_path. Countries include separately attributed LDA codes and FARA source labels; FARA labels are not guessed ISO codes.',
+    'List official LDA issue codes, filing types, government entities, contribution types, countries and states, or explain identifiers, methodology and FARA rules. Optional filter performs case-insensitive literal token-AND matching across the complete vocabulary. Each call returns a fixed window of up to 125 whole entries; follow next_cursor for the rest. LDA filter codes are the value of entries with source lda, such as US or CN for countries and WA for states. Countries also list FARA country/location labels (source fara) for the uslobbying_search_foreign_agents country filter; they are source spellings, not ISO codes, and never valid LDA filter values.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.strictObject({
     topic: z
@@ -244,24 +237,23 @@ export const listReference = tool(NAME, {
       .min(1)
       .optional()
       .describe('Pinned continuation; omit original topic/filter or repeat them unchanged.'),
-    ...RecordWindowInputShape,
   }),
   output: Output,
   errors: [
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Topic is missing, continuation scope changes, or record selectors conflict or select an invalid path.',
+      when: 'The first call omits topic.',
       recovery:
-        'Call uslobbying_list_reference with a topic to start; repeat original filters unchanged for cursor calls, or use record_handle with only record selectors.',
+        'Call uslobbying_list_reference with a topic such as issue_codes, states or methodology; continuation calls need only cursor.',
     },
     {
       reason: 'cursor_invalid',
       code: JsonRpcErrorCode.ValidationError,
       thrownBy: 'service',
-      when: 'A cursor or record handle is unavailable, expired or belongs to another tenant or tool.',
+      when: 'A cursor is unavailable or expired, belongs to another tenant or tool, or arrives with a changed topic or filter.',
       recovery:
-        'Restart uslobbying_list_reference with the original topic and filter, omitting cursor and record_handle.',
+        'Restart uslobbying_list_reference with the original topic and filter, omitting cursor.',
     },
     {
       reason: 'acquisition_storage_unavailable',
@@ -270,14 +262,6 @@ export const listReference = tool(NAME, {
       when: 'Storage cannot retain the complete vocabulary or its checkpoint safely.',
       recovery:
         'Retry the last uslobbying_list_reference cursor after storage becomes available, or restart with a narrower literal filter.',
-    },
-    {
-      reason: 'result_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'Complete metadata leaves no space for a result window.',
-      recovery:
-        'Retry uslobbying_list_reference with a narrower filter, or select a deeper record_path for a retained entry.',
     },
     {
       reason: 'source_schema_changed',
@@ -298,32 +282,8 @@ export const listReference = tool(NAME, {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    const disclosure = deliveryDisclosure(input);
-    input = normalizeDelivery(input);
     const filter = optionalText(input.filter)?.toLowerCase().split(/\s+/).join(' ');
     const filters = { ...(input.topic && { topic: input.topic }), ...(filter && { filter }) };
-    if (input.record_handle) {
-      if (Object.keys(filters).length || input.cursor)
-        throw ctx.fail(
-          'invalid_filter',
-          'record_handle is exclusive with topic, filter and cursor.',
-        );
-      return Output.parse(
-        await readRecordWindow(ctx, {
-          ...input,
-          tool: NAME,
-          record_handle: input.record_handle,
-          buildResponse: (record_window, provenance) => ({
-            ...provenance,
-            ...disclosure,
-            record_window,
-            truncated: !record_window.complete,
-          }),
-        }),
-      );
-    }
-    if (input.record_path !== '' || input.record_offset !== 0 || input.record_limit !== 25)
-      throw ctx.fail('invalid_filter', 'Record selectors require record_handle.');
     const checkpoint = input.cursor
       ? await resolveCheckpoint(ctx, { tool: NAME, cursor: input.cursor })
       : undefined;
@@ -338,71 +298,22 @@ export const listReference = tool(NAME, {
         provenance,
         ...(input.cursor && { cursor: input.cursor }),
         ...(records && { records: z.array(JsonValueSchema).parse(records) }),
-        maxRecords: 125,
-        identify: (record) => createHash('sha256').update(JSON.stringify(record)).digest('hex'),
+        pageSize: WINDOW_ENTRIES,
         buildResponse: (window, _metadata, stored) => ({
           ...stored,
-          ...disclosure,
           entries: window.records,
           ...(window.next_cursor && { next_cursor: window.next_cursor }),
           output_complete: window.output_complete,
           truncated: window.truncated,
           offset: window.offset,
           records_returned: window.records_returned,
-          records_deferred: window.records_deferred,
-          record_handles: window.record_handles,
           cursor_expires_at: window.cursor_expires_at,
         }),
       });
       return Output.parse(result.response);
     };
     if (checkpoint) return deliver();
-    let value = cache.get(topic);
-    if (!value || value.expires <= Date.now()) {
-      let entries: Entries;
-      const source_urls = [
-        'https://lda.gov/api/v1/',
-        'https://lobbyingdisclosure.house.gov/ldaguidance.pdf',
-      ];
-      let retrieved_at = new Date().toISOString();
-      const explanations = authored[topic];
-      if (explanations) entries = explanations;
-      else {
-        const constants = await getLdaService().constants(
-          z
-            .enum([
-              'issue_codes',
-              'filing_types',
-              'government_entities',
-              'contribution_types',
-              'countries',
-            ])
-            .parse(topic),
-          {
-            signal: ctx.signal,
-          },
-        );
-        entries = constants.map((row) => ({
-          value: String(row.value),
-          name: row.name,
-          source: 'lda',
-        }));
-        if (topic === 'countries') {
-          const fara = await getFaraService().countries(ctx.signal);
-          entries.push(
-            ...fara.countries.map((country) => ({
-              value: country,
-              name: country,
-              source: 'fara' as const,
-            })),
-          );
-          source_urls.push(...fara.source_urls);
-          retrieved_at = fara.retrieved_at;
-        }
-      }
-      value = { expires: Date.now() + SOURCE_CACHE_TTL_MS, entries, retrieved_at, source_urls };
-      cache.set(topic, value);
-    }
+    const value = await vocabulary(topic, ctx.signal);
     const tokens = filter?.split(' ') ?? [];
     const entries = value.entries.filter((entry) =>
       tokens.every((token) =>
@@ -420,7 +331,6 @@ export const listReference = tool(NAME, {
         : [
             'No reference entries matched; call uslobbying_list_reference with the same topic and omit filter.',
           ],
-      retrieval_tool: NAME,
     });
   },
   format: formatResult,

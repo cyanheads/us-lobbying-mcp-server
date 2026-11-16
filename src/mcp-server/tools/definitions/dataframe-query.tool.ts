@@ -11,7 +11,7 @@ import { queryCanvas } from '@/services/canvas/canvas-service.js';
 export const dataframeQueryTool = tool('uslobbying_dataframe_query', {
   title: 'Query disclosure tables',
   description:
-    'Run one read-only SELECT over staged disclosure tables, materialize the complete result, then retrieve whole rows by result_table and next_offset without rerunning SQL. Inspect columns with uslobbying_dataframe_describe first.',
+    'Run one read-only SELECT over staged disclosure tables, materialize the complete result, then retrieve whole rows by result_table and next_offset without rerunning SQL. Each call returns row_limit rows, or the rest of the result when fewer remain. Rows follow the materialized SQL result order set by a top-level ORDER BY; an ORDER BY only inside a CTE or subquery does not guarantee it, and without one the order is fixed once materialized. Inspect columns with uslobbying_dataframe_describe first.',
   annotations: {
     readOnlyHint: false,
     destructiveHint: false,
@@ -43,14 +43,16 @@ export const dataframeQueryTool = tool('uslobbying_dataframe_query', {
       .int()
       .nonnegative()
       .optional()
-      .describe('Canonical row offset for result_table, default zero.'),
+      .describe(
+        'Row offset into result_table, default zero, in the materialized SQL result order set by a top-level ORDER BY; an ORDER BY only inside a CTE or subquery does not guarantee it. An offset equal to row_count returns no rows.',
+      ),
     row_limit: z
       .number()
       .multipleOf(1)
       .min(1)
       .default(25)
       .describe(
-        'Maximum whole rows in this response; positive integers clamp to 100, then to any lower provider ceiling.',
+        'Whole rows to return, default 25, at most 100 per call; larger values clamp to 100, then to any lower provider ceiling, and the clamp is disclosed in delivery_limits.',
       ),
   }),
   output: QueryWindowSchema.extend({
@@ -67,9 +69,9 @@ export const dataframeQueryTool = tool('uslobbying_dataframe_query', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'New SQL and result-table selectors are missing or combined.',
+      when: 'New SQL and result-table selectors are missing or combined, offset passes the result row_count, or row_limit exceeds 100 while the server rejects over-cap values.',
       recovery:
-        'Provide sql and optional register_as, or result_table and optional offset, with canvas_id.',
+        'Provide sql with optional register_as, or result_table with an offset at most its row_count, plus canvas_id.',
     },
     {
       reason: 'canvas_unavailable',
@@ -166,14 +168,6 @@ export const dataframeQueryTool = tool('uslobbying_dataframe_query', {
       when: 'Requested result name already exists.',
       recovery:
         'Call uslobbying_dataframe_describe with this canvas_id, then retry uslobbying_dataframe_query with a new register_as name or omit register_as.',
-    },
-    {
-      reason: 'query_row_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'One complete row or metadata exceeds the wire budget.',
-      recovery:
-        'Call uslobbying_dataframe_describe for this result table, then use uslobbying_dataframe_query to SELECT fewer columns or explicit SUBSTR windows of the oversized value.',
     },
   ],
   async handler(input, ctx) {

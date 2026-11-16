@@ -1,18 +1,16 @@
 /** @fileoverview Scan storage schemas and caller-facing window contracts. @module services/acquisition/types */
 import { z } from '@cyanheads/mcp-ts-core';
-import { CoverageSchema, type RecordHandleSchema } from '@/domain/contracts.js';
+import { CoverageSchema } from '@/domain/contracts.js';
 import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
 
-/** A complete caller envelope is built before measuring delivery capacity. */
+/** One count-bounded window of whole records; callers wrap it in their complete envelope. */
 export interface DeliveryWindow {
   coverage: z.infer<typeof CoverageSchema>;
   cursor_expires_at: string;
   next_cursor?: string;
   offset: number;
   output_complete: boolean;
-  record_handles: z.infer<typeof RecordHandleSchema>[];
   records: JsonValue[];
-  records_deferred: number;
   records_returned: number;
   total_records?: number;
   truncated: boolean;
@@ -62,10 +60,3 @@ export const ManifestSchema = z.object({
 });
 /** Parsed storage manifest. */
 export type Manifest = z.infer<typeof ManifestSchema>;
-/** Stored records retain caller provenance and tool routing independently of search advancement. */
-export const StoredRecordSchema = z.object({
-  tool: z.string(),
-  expires: z.number().int(),
-  value: JsonValueSchema,
-  provenance: z.record(z.string(), JsonValueSchema),
-});

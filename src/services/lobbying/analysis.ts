@@ -6,7 +6,24 @@ import { ActivityRowSchema, ContributionReportSchema, MoneySchema } from '@/doma
 type GovernmentEntity = z.infer<typeof GovernmentEntitySchema>;
 
 const METHOD = 'latest_posted_within_relationship_period' as const;
-const PERIODS = ['first_quarter', 'second_quarter', 'third_quarter', 'fourth_quarter'];
+type Grain = 'quarterly' | 'semiannual';
+interface Period {
+  grain: Grain;
+  types: RegExp;
+}
+/** LD-2 report periods and the filing types valid in each; a trailing `Y` marks a no-activity report. */
+const PERIODS = new Map<string, Period>([
+  ['first_quarter', { grain: 'quarterly', types: /^(?:Q1|1[TA@])Y?$/ }],
+  ['second_quarter', { grain: 'quarterly', types: /^(?:Q2|2[TA@])Y?$/ }],
+  ['third_quarter', { grain: 'quarterly', types: /^(?:Q3|3[TA@])Y?$/ }],
+  ['fourth_quarter', { grain: 'quarterly', types: /^(?:Q4|4[TA@])Y?$/ }],
+  ['mid_year', { grain: 'semiannual', types: /^M[MTA@]Y?$/ }],
+  ['year_end', { grain: 'semiannual', types: /^Y[YTA@]Y?$/ }],
+]);
+/** LD-2 reports were semiannual through 2007 and quarterly from the first quarter of 2008. */
+function statutoryGrain(year: number): Grain {
+  return year < 2008 ? 'semiannual' : 'quarterly';
+}
 /** Selected records always have explicit relationship identities. */
 export type SelectedFiling = Filing & {
   client: NonNullable<Filing['client']>;
@@ -19,7 +36,16 @@ function hasRelationship(filing: Filing): filing is SelectedFiling {
 export interface FilingSelection {
   candidate_filing_uuids: string[];
   client_id: string | null;
-  exclusion_reason?: 'registration' | 'non_quarterly' | 'unknown_variant' | 'missing_relationship';
+  /**
+   * `non_quarterly`: a period that is neither quarterly nor semiannual. `off_cycle_period`: the
+   * non-statutory grain's period in a relationship-year that also filed its statutory grain.
+   */
+  exclusion_reason?:
+    | 'registration'
+    | 'non_quarterly'
+    | 'off_cycle_period'
+    | 'unknown_variant'
+    | 'missing_relationship';
   period: string;
   registrant_id: string | null;
   selected_filing_uuid?: string;
@@ -45,12 +71,12 @@ export function centsToMoney(cents: bigint): string {
   const absolute = cents < 0n ? -cents : cents;
   return `${cents < 0n ? '-' : ''}${absolute / 100n}.${String(absolute % 100n).padStart(2, '0')}`;
 }
-function knownQuarterly(filing: Filing): boolean {
-  const index = PERIODS.indexOf(filing.filing_period) + 1;
-  return index > 0 && new RegExp(`^(?:Q${index}|${index}[TA@])Y?$`).test(filing.filing_type);
-}
-/** Select latest postings before applying any issue, text, or monetary predicates. */
-export async function selectQuarterlyFilings(
+/**
+ * Select the latest posting per registrant/client/year/period before any issue, text, or monetary
+ * predicate. A relationship-year that filed both quarterly and semiannual periods keeps only the
+ * year's statutory grain, so one year's activity is never counted at both grains.
+ */
+export async function selectPeriodFilings(
   filings: Iterable<Filing> | AsyncIterable<Filing>,
 ): Promise<{
   selected: SelectedFiling[];
@@ -59,6 +85,9 @@ export async function selectQuarterlyFilings(
   const groups = new Map<
     string,
     {
+      period: Period;
+      /** Grains filed by the group's registrant/client/year, shared with its sibling groups. */
+      yearGrains: Set<Grain>;
       latest: number;
       candidates: [
         { filing: SelectedFiling; order: number },
@@ -67,6 +96,7 @@ export async function selectQuarterlyFilings(
       superseded: { uuid: string; order: number }[];
     }
   >();
+  const relationshipYears = new Map<string, Set<Grain>>();
   const seen = new Set<string>();
   const selections: FilingSelection[] = [];
   let order = 0;
@@ -86,25 +116,35 @@ export async function selectQuarterlyFilings(
       candidate_filing_uuids: [filing.filing_uuid],
       superseded_filing_uuids: [],
     };
-    const reason = ['RR', 'RA'].includes(filing.filing_type)
-      ? 'registration'
-      : !PERIODS.includes(filing.filing_period)
-        ? 'non_quarterly'
-        : undefined;
-    if (reason) {
-      selections.push({ ...excluded, exclusion_reason: reason });
+    if (['RR', 'RA'].includes(filing.filing_type)) {
+      selections.push({ ...excluded, exclusion_reason: 'registration' });
+      continue;
+    }
+    const period = PERIODS.get(filing.filing_period);
+    if (!period) {
+      selections.push({ ...excluded, exclusion_reason: 'non_quarterly' });
       continue;
     }
     if (!hasRelationship(filing)) {
       selections.push({ ...excluded, exclusion_reason: 'missing_relationship' });
       continue;
     }
+    const relationshipYear = JSON.stringify([base.registrant_id, base.client_id, base.year]);
+    const yearGrains = relationshipYears.get(relationshipYear) ?? new Set<Grain>();
+    yearGrains.add(period.grain);
+    relationshipYears.set(relationshipYear, yearGrains);
     const key = JSON.stringify([base.registrant_id, base.client_id, base.year, base.period]);
     const group = groups.get(key);
     const posted = Date.parse(filing.dt_posted);
     const index = order++;
     if (!group)
-      groups.set(key, { latest: posted, candidates: [{ filing, order: index }], superseded: [] });
+      groups.set(key, {
+        period,
+        yearGrains,
+        latest: posted,
+        candidates: [{ filing, order: index }],
+        superseded: [],
+      });
     else if (posted > group.latest) {
       for (const candidate of group.candidates)
         group.superseded.push({ uuid: candidate.filing.filing_uuid, order: candidate.order });
@@ -115,7 +155,7 @@ export async function selectQuarterlyFilings(
     } else group.superseded.push({ uuid: filing.filing_uuid, order: index });
   }
   const selected: SelectedFiling[] = [];
-  for (const { candidates, superseded } of groups.values()) {
+  for (const { period, yearGrains, candidates, superseded } of groups.values()) {
     const first = candidates[0].filing;
     const base = {
       registrant_id: first.registrant.id,
@@ -128,8 +168,10 @@ export async function selectQuarterlyFilings(
         .sort((a, b) => a.order - b.order)
         .map((item) => item.uuid),
     };
-    if (candidates.length > 1) selections.push({ ...base, status: 'ambiguous' });
-    else if (!knownQuarterly(first))
+    if (yearGrains.size > 1 && period.grain !== statutoryGrain(first.filing_year))
+      selections.push({ ...base, status: 'excluded', exclusion_reason: 'off_cycle_period' });
+    else if (candidates.length > 1) selections.push({ ...base, status: 'ambiguous' });
+    else if (!period.types.test(first.filing_type))
       selections.push({ ...base, status: 'excluded', exclusion_reason: 'unknown_variant' });
     else {
       selected.push(first);
@@ -253,7 +295,7 @@ export async function analyzeFilings(
   filings: Iterable<Filing> | AsyncIterable<Filing>,
   predicates: FilingPredicates = {},
 ) {
-  const selection = await selectQuarterlyFilings(filings);
+  const selection = await selectPeriodFilings(filings);
   const selected = selection.selected.filter((filing) => matchesFiling(filing, predicates));
   const years = [...new Set(selection.selections.map((item) => item.year))].sort((a, b) => a - b);
   const breakdownLedgers = (records: readonly Filing[]) =>
@@ -276,6 +318,14 @@ export async function analyzeFilings(
     string,
     { registrant_id: string; name: string; client_ids: Set<string>; filings: Filing[] }
   >();
+  /**
+   * Keyed by registrant and client record `id` (never the secondary `client.client_id`), so every
+   * row names exactly one registrant.
+   */
+  const clients = new Map<
+    string,
+    { client_id: string; name: string; registrant_id: string; filings: Filing[] }
+  >();
   const issues = new Map<string, Filing[]>();
   const entities = new Map<string, { entity: GovernmentEntity; filing_uuids: Set<string> }>();
   for (const filing of selected) {
@@ -288,6 +338,15 @@ export async function analyzeFilings(
     firm.client_ids.add(filing.client.id);
     firm.filings.push(filing);
     firms.set(firm.registrant_id, firm);
+    const relationship = JSON.stringify([filing.registrant.id, filing.client.id]);
+    const client = clients.get(relationship) ?? {
+      client_id: filing.client.id,
+      name: filing.client.name,
+      registrant_id: filing.registrant.id,
+      filings: [],
+    };
+    client.filings.push(filing);
+    clients.set(relationship, client);
     for (const code of new Set(
       filing.lobbying_activities?.map((activity) => activity.general_issue_code),
     )) {
@@ -314,6 +373,13 @@ export async function analyzeFilings(
       client_ids: [...firm.client_ids],
       filing_uuids: firm.filings.map((filing) => filing.filing_uuid),
       annual_ledgers: breakdownLedgers(firm.filings),
+    })),
+    clients: [...clients.values()].map((client) => ({
+      client_id: client.client_id,
+      name: client.name,
+      registrant_id: client.registrant_id,
+      filing_uuids: client.filings.map((filing) => filing.filing_uuid),
+      annual_ledgers: breakdownLedgers(client.filings),
     })),
     issue_codes: [...issues].map(([issue_code, records]) => ({
       issue_code,
@@ -342,7 +408,7 @@ export async function analyzeFilings(
       attribution_basis: 'whole_filing_mentions_issue' as const,
       issue_buckets_overlap: true,
       amounts_are_separate: true,
-      client_identity: 'caller_selected_relationships' as const,
+      client_identity: 'relationship_records' as const,
     },
   };
 }

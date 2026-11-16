@@ -11,10 +11,9 @@ let retainedBytes = 0;
 
 /** Expired, unreadable and foreign tokens have the same restart recovery. */
 export function invalidCursor() {
-  return validationError(
-    'The continuation or record is unavailable; restart the original scoped request.',
-    { reason: 'cursor_invalid' },
-  );
+  return validationError('The continuation is unavailable; restart the original scoped request.', {
+    reason: 'cursor_invalid',
+  });
 }
 /** Capacity refusal preserves the last published checkpoint. */
 export function storageUnavailable(cause?: unknown) {

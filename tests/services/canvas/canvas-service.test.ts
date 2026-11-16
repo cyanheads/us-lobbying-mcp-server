@@ -1,5 +1,6 @@
 /** @fileoverview Real DuckDB staging, rollback and lifecycle behavior. @module tests/services/canvas/canvas-service */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -133,6 +134,60 @@ describe('complete streamed disclosure staging', () => {
     expect(await f.instance.describe()).toEqual([]);
   });
 
+  it.each(['describe all', 'describe one', 'query', 'stage'] as const)(
+    'interrupts the engine describe a caller abort lands on: %s',
+    async (entry) => {
+      await queryCanvas(
+        { canvas_id: f.instance.canvasId, sql: 'SELECT 1 AS n', register_as: 'kept' },
+        f.ctx,
+      );
+      const controller = new AbortController();
+      const reason = new DOMException('Cancelled describe', 'AbortError');
+      const ctx = { ...f.ctx, signal: controller.signal };
+      const provider = f.canvas.getProvider();
+      const original = provider.describe.bind(provider);
+      const outcomes: unknown[] = [];
+      vi.spyOn(provider, 'describe').mockImplementation(async (...args) => {
+        controller.abort(reason);
+        try {
+          const tables = await original(...args);
+          outcomes.push('completed');
+          return tables;
+        } catch (error) {
+          outcomes.push(error);
+          throw error;
+        }
+      });
+      const run = {
+        'describe all': () => describeCanvas({ canvas_id: f.instance.canvasId }, ctx),
+        'describe one': () =>
+          describeCanvas({ canvas_id: f.instance.canvasId, table_name: 'kept' }, ctx),
+        query: () =>
+          queryCanvas(
+            { canvas_id: f.instance.canvasId, sql: 'SELECT 2 AS n', register_as: 'q' },
+            ctx,
+          ),
+        stage: async () =>
+          stageFilings(
+            {
+              canvas_id: f.instance.canvasId,
+              raw_filings: [filing(1)],
+              selections: (await analyzeFilings([filing(1)])).selections,
+              selected_filings: [],
+              activities: [],
+              provenance,
+              source_tool: 'uslobbying_get_client_profile',
+            },
+            ctx,
+          ),
+      }[entry];
+      await expect(run()).rejects.toBe(reason);
+      expect(outcomes[0]).toMatchObject({ data: { reason: 'cancelled' } });
+      vi.restoreAllMocks();
+      expect((await f.instance.describe()).map((table) => table.name)).toEqual(['kept']);
+    },
+  );
+
   it('rejects missing table and unknown canvas with actionable recovery', async () => {
     await expect(
       describeCanvas({ canvas_id: f.instance.canvasId, table_name: 'absent' }, f.ctx),
@@ -150,27 +205,26 @@ describe('complete streamed disclosure staging', () => {
     });
   });
 
-  it('rejects describe metadata when stored SQL exceeds the complete wire budget', async () => {
-    await queryCanvas(
-      {
-        canvas_id: f.instance.canvasId,
-        sql: `SELECT 1 AS n /* ${'long stored SQL '.repeat(2000)} */`,
-        register_as: 'long_sql',
-      },
+  it('describes every table whole, however long its stored SQL', async () => {
+    const data = await stage(f);
+    const sql = (n: number) => `SELECT ${n} AS n /* ${'long stored SQL '.repeat(2000)} */`;
+    for (const n of [1, 2])
+      await queryCanvas(
+        { canvas_id: f.instance.canvasId, sql: sql(n), register_as: `long_sql_${n}` },
+        f.ctx,
+      );
+    const one = await describeCanvas(
+      { canvas_id: f.instance.canvasId, table_name: 'long_sql_1' },
       f.ctx,
     );
-    await expect(
-      describeCanvas({ canvas_id: f.instance.canvasId, table_name: 'long_sql' }, f.ctx),
-    ).rejects.toMatchObject({
-      data: {
-        reason: 'query_row_too_large',
-        canvas_id: f.instance.canvasId,
-        result_table: 'long_sql',
-        describe_tool: 'uslobbying_dataframe_describe',
-        query_tool: 'uslobbying_dataframe_query',
-        recovery: { hint: expect.stringContaining('SELECT') },
-      },
-    });
+    expect(one.tables).toEqual([
+      expect.objectContaining({ table_name: 'long_sql_1', row_count: 1, sql: sql(1) }),
+    ]);
+    const all = await describeCanvas({ canvas_id: f.instance.canvasId }, f.ctx);
+    expect(all.tables.map((table) => table.table_name).sort()).toEqual(
+      [...data.tables.map((table) => table.table_name), 'long_sql_1', 'long_sql_2'].sort(),
+    );
+    expect(all.tables.find((table) => table.table_name === 'long_sql_2')?.sql).toBe(sql(2));
   });
 
   it('keeps amendment, ambiguous and excluded decisions queryable without double counting money', async () => {
@@ -294,5 +348,116 @@ describe('complete streamed disclosure staging', () => {
     expect(JSON.parse(String(source.rows[0]!.source_fields))).toMatchObject({
       selection_status: 'source supplied value',
     });
+  });
+});
+
+describe('SQL result windows in materialized order', () => {
+  let f: Awaited<ReturnType<typeof fixture>>;
+  afterEach(async () => {
+    await f.close();
+  });
+
+  async function materialize(sql: string, register_as: string, row_limit = 100) {
+    return await queryCanvas(
+      { canvas_id: f.instance.canvasId, sql, register_as, row_limit },
+      f.ctx,
+    );
+  }
+  async function window(result_table: string, offset: number, row_limit: number) {
+    return await queryCanvas(
+      { canvas_id: f.instance.canvasId, result_table, offset, row_limit },
+      f.ctx,
+    );
+  }
+  /** Follow next_offset from zero, checking every window is full until the last. */
+  async function readAll(table: string, rowLimit: number) {
+    const rows: Record<string, unknown>[] = [];
+    let offset = 0;
+    for (;;) {
+      const page = await window(table, offset, rowLimit);
+      expect(page).toMatchObject({ offset, rows_returned: page.rows.length });
+      rows.push(...page.rows);
+      if (page.next_offset === undefined) {
+        expect(page).toMatchObject({ output_complete: true, truncated: false });
+        expect(rows).toHaveLength(page.row_count);
+        return rows;
+      }
+      expect(page.rows).toHaveLength(rowLimit);
+      expect(page.next_offset).toBe(offset + rowLimit);
+      offset = page.next_offset;
+    }
+  }
+  /** The materialized table read straight from the engine, in its stored order. */
+  async function stored(table: string) {
+    const result = await f.instance.query(`SELECT * FROM ${table}`, { rowLimit: 100 });
+    expect(result.truncated).toBeUndefined();
+    return result.rows;
+  }
+  const ranked = (n: number, step = 7919) =>
+    Array.from({ length: n }, (_, i) => ({ i, score: (i * step) % n })).sort(
+      (a, b) => b.score - a.score,
+    );
+
+  it('pages a ranked ORDER BY … DESC result in query order with no duplicates or gaps', async () => {
+    f = await fixture();
+    const expected = ranked(1000);
+    const first = await materialize(
+      'SELECT CAST(i AS INTEGER) AS i, CAST((i * 7919) % 1000 AS INTEGER) AS score FROM range(1000) t(i) ORDER BY score DESC',
+      'ranked',
+    );
+    expect(first.rows).toEqual(expected.slice(0, 100));
+    expect(first).toMatchObject({ row_count: 1000, next_offset: 100, row_order: 'sql_result' });
+    expect(await readAll('ranked', 100)).toEqual(expected);
+    expect(await readAll('ranked', 37)).toEqual(expected);
+  });
+
+  it('keeps tied rows in their materialized order for every row_limit and pass', async () => {
+    f = await fixture();
+    await materialize(
+      'SELECT CAST(i AS INTEGER) AS i, CAST(i % 3 AS INTEGER) AS bucket FROM range(300) t(i) ORDER BY bucket',
+      'ties',
+    );
+    const passes = [];
+    for (const rowLimit of [7, 25, 100, 25]) passes.push(await readAll('ties', rowLimit));
+    for (const pass of passes) expect(pass).toEqual(passes[0]);
+    const rows = z.array(z.object({ i: z.number(), bucket: z.number() })).parse(passes[0]);
+    expect(rows.map((row) => row.bucket)).toEqual([0, 1, 2].flatMap((b) => Array(100).fill(b)));
+    expect(rows.map((row) => row.i).sort((a, b) => a - b)).toEqual([...Array(300).keys()]);
+  });
+
+  it('pages a result without ORDER BY in its stored order, every row exactly once', async () => {
+    f = await fixture();
+    await materialize('SELECT CAST(99 - i AS INTEGER) AS n FROM range(100) t(i)', 'unordered', 7);
+    await materialize(
+      "SELECT 'k' || CAST(i % 50 AS VARCHAR) AS k, COUNT(*) AS n FROM range(1000) t(i) GROUP BY 1",
+      'grouped',
+      7,
+    );
+    for (const table of ['unordered', 'grouped']) {
+      const order = await stored(table);
+      const first = await readAll(table, 7);
+      expect(first).toEqual(order);
+      expect(await readAll(table, 7)).toEqual(first);
+      expect(await readAll(table, 100)).toEqual(first);
+    }
+    const grouped = z
+      .array(z.object({ k: z.string(), n: z.string() }))
+      .parse(await stored('grouped'));
+    expect(new Set(grouped.map((row) => row.k)).size).toBe(50);
+    expect(grouped.every((row) => row.n === '20')).toBe(true);
+  });
+
+  it('reads windows across multi-threaded row groups in query order', async () => {
+    f = await fixture({ memoryLimitMb: 512 });
+    const expected = ranked(300_000);
+    await materialize(
+      'SELECT CAST(i AS INTEGER) AS i, CAST((i * 7919) % 300000 AS INTEGER) AS score FROM range(300000) t(i) ORDER BY score DESC',
+      'large',
+    );
+    // DuckDB row groups hold 122,880 rows; windows straddle both boundaries and the tail.
+    for (const offset of [0, 122_830, 245_710, 299_950]) {
+      const page = await window('large', offset, 100);
+      expect(page.rows).toEqual(expected.slice(offset, offset + 100));
+    }
   });
 });

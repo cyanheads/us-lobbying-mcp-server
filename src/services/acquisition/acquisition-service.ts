@@ -1,4 +1,4 @@
-/** @fileoverview Revisioned scans, immutable source chunks and bounded complete-record delivery. @module services/acquisition/acquisition-service */
+/** @fileoverview Revisioned scans, immutable source chunks and count-bounded whole-record delivery. @module services/acquisition/acquisition-service */
 import { createHash, randomUUID } from 'node:crypto';
 import { type Context, z } from '@cyanheads/mcp-ts-core';
 import { serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
@@ -6,20 +6,16 @@ import {
   ACQUISITION_TTL_MS,
   type AcquisitionCheckpoint,
   type AcquisitionSource,
-  FULL_RESULT_TARGET_BYTES,
   TOOL_DEADLINE_MS,
 } from '@/domain/contracts.js';
-import { fullResultBytes } from '@/domain/format.js';
 import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
-import { assertFits, deferRecord } from './record-window.js';
 import { exclusive, invalidCursor, readJson, removeJson, writeJson } from './storage.js';
-import {
-  type DeliveryWindow,
-  type Manifest,
-  ManifestSchema,
-  type ResponseBuilder,
-} from './types.js';
+import { type Manifest, ManifestSchema, type ResponseBuilder } from './types.js';
 
+/** Rows per stored retained or final chunk; delivery windows read across chunk boundaries. */
+const CHUNK_ROWS = 125;
+const pageSizeSchema = z.number().int().min(1);
+const maxPagesSchema = z.number().int().min(1).max(5);
 const rowsSchema = z.array(JsonValueSchema);
 const objectSchema = z.record(z.string(), JsonValueSchema);
 const indexSchema = z.array(z.string());
@@ -134,14 +130,6 @@ function initial(options: {
     delivered: 0,
   };
 }
-/** Stored provenance plus the current coverage and expiry, retained with any deferred parent. */
-function windowProvenance(manifest: Manifest): Record<string, JsonValue> {
-  return {
-    ...manifest.provenance,
-    coverage: JsonValueSchema.parse(manifest.coverage),
-    cursor_expires_at: new Date(manifest.expires).toISOString(),
-  };
-}
 /** Source adapters own all network validation, rate pacing and absolute deadlines. */
 export interface AcquireOptions {
   buildResponse: ResponseBuilder;
@@ -155,9 +143,11 @@ export interface AcquireOptions {
     records: Iterable<JsonValue> | AsyncIterable<JsonValue>;
     metadata?: Record<string, JsonValue>;
   }>;
-  identifyFinal?: (record: JsonValue) => string;
   matches?: (record: JsonValue) => boolean;
+  /** Upstream pages one call may fetch, 1–5; default 1. */
   maxPages?: number;
+  /** Whole records per delivered window; the caller clamps it to its served ceiling. */
+  pageSize: number;
   provenance: Record<string, JsonValue>;
   retainAll?: boolean;
   scanKind: string;
@@ -169,75 +159,74 @@ export interface AcquisitionResult {
   checkpoint: AcquisitionCheckpoint;
   response: object;
 }
-async function windowRows(
+/** Build one window of whole records; a continuation is offered while rows or acquisition remain. */
+function respond(
+  manifest: Manifest,
+  buildResponse: ResponseBuilder,
+  window: { records: JsonValue[]; offset: number; more: boolean; total?: number | undefined },
+): object {
+  const next = window.more ? { next_cursor: manifest.cursor } : {};
+  return buildResponse(
+    {
+      records: window.records,
+      records_returned: window.records.length,
+      output_complete: !window.more,
+      truncated: window.more,
+      coverage: { ...manifest.coverage, ...next },
+      cursor_expires_at: new Date(manifest.expires).toISOString(),
+      offset: window.offset,
+      ...next,
+      ...(window.total === undefined ? {} : { total_records: window.total }),
+    },
+    manifest.finalMetadata,
+    manifest.provenance,
+  );
+}
+/** Deliver the first `pageSize` pending matches; the window is short only at the end or while collecting. */
+function pendingWindow(manifest: Manifest, buildResponse: ResponseBuilder, pageSize: number) {
+  const records = manifest.pending.slice(0, pageSize);
+  const offset = manifest.delivered;
+  manifest.pending = manifest.pending.slice(records.length);
+  manifest.delivered += records.length;
+  return respond(manifest, buildResponse, {
+    records,
+    offset,
+    more: manifest.pending.length > 0 || !manifest.coverage.complete,
+  });
+}
+/** Deliver `pageSize` final rows from the stored offset, reading across chunk boundaries. */
+async function finalWindow(
   ctx: Context,
   manifest: Manifest,
-  options: {
-    records: JsonValue[];
-    identify: (record: JsonValue) => string;
-    provenance: Record<string, JsonValue>;
-    buildResponse: ResponseBuilder;
-    total?: number;
-    offset?: number;
-    forceCursor?: boolean;
-  },
-): Promise<{ response: object; consumed: number }> {
+  buildResponse: ResponseBuilder,
+  pageSize: number,
+): Promise<object> {
+  const { finalChunks: chunks, finalCount: total, finalOffset: offset } = manifest;
+  if (!chunks || total === undefined || offset === undefined) throw invalidCursor();
+  const end = Math.min(offset + pageSize, total);
   const records: JsonValue[] = [];
-  const handles: DeliveryWindow['record_handles'] = [];
-  let consumed = 0;
-  const make = (): object => {
-    const more =
-      options.forceCursor === true ||
-      consumed < options.records.length ||
-      !manifest.coverage.complete;
-    const coverage = { ...manifest.coverage, ...(more ? { next_cursor: manifest.cursor } : {}) };
-    const window: DeliveryWindow = {
-      records,
-      record_handles: handles,
-      records_deferred: handles.length,
-      records_returned: records.length,
-      output_complete: !more,
-      truncated: more || handles.length > 0,
-      coverage,
-      cursor_expires_at: new Date(manifest.expires).toISOString(),
-      offset: options.offset ?? manifest.delivered,
-      ...(more ? { next_cursor: manifest.cursor } : {}),
-      ...(options.total === undefined ? {} : { total_records: options.total }),
-    };
-    return options.buildResponse(window, manifest.finalMetadata, manifest.provenance);
-  };
-  assertFits(make());
-  for (const row of options.records) {
-    records.push(row);
-    consumed++;
-    if (fullResultBytes(make()) <= FULL_RESULT_TARGET_BYTES) continue;
-    records.pop();
-    consumed--;
-    if (records.length > 0 || handles.length > 0) break;
-    const handle = await deferRecord(ctx, {
-      scanId: manifest.id,
-      tool: manifest.tool,
-      identity: options.identify(row),
-      value: row,
-      expires: manifest.expires,
-      provenance: options.provenance,
-    });
-    handles.push(handle);
-    consumed++;
-    assertFits(make());
+  for (let index = Math.floor(offset / CHUNK_ROWS); offset + records.length < end; index++) {
+    const key = chunks[index];
+    const chunk = key === undefined ? undefined : rowsSchema.safeParse(await readJson(ctx, key));
+    if (!chunk?.success) throw invalidCursor();
+    const start = Math.max(offset - index * CHUNK_ROWS, 0);
+    records.push(...chunk.data.slice(start, start + end - offset - records.length));
   }
-  const response = make();
-  JsonValueSchema.parse(response);
-  return { response, consumed };
+  manifest.finalOffset = offset + records.length;
+  return respond(manifest, buildResponse, {
+    records,
+    offset,
+    total,
+    more: manifest.finalOffset < total,
+  });
 }
-/** Acquire bounded pages or drain a retained tail, publishing progress only after all writes succeed. */
+/**
+ * Top up pending matches to `pageSize` within `maxPages` and the call deadline, or drain a retained
+ * tail, then deliver one count-bounded window. Progress publishes only after every write succeeds.
+ */
 export async function acquire(ctx: Context, options: AcquireOptions): Promise<AcquisitionResult> {
-  const maxPages = z
-    .number()
-    .int()
-    .min(1)
-    .max(5)
-    .parse(options.maxPages ?? 1);
+  const maxPages = maxPagesSchema.parse(options.maxPages ?? 1);
+  const pageSize = pageSizeSchema.parse(options.pageSize);
   const deadline = Date.now() + TOOL_DEADLINE_MS;
   const manifest = options.cursor
     ? await load(ctx, options.cursor, options.tool, options.scanKind, options.filters)
@@ -270,107 +259,83 @@ export async function acquire(ctx: Context, options: AcquireOptions): Promise<Ac
     const changedShards = new Set<number>();
     const replaced: string[] = [];
     const fetched: JsonValue[] = [];
-    const identify = (row: JsonValue): string => options.source.identify(row);
-    if (!next.pending.length && !next.coverage.complete) {
-      for (let pageIndex = 0; pageIndex < maxPages && !next.coverage.complete; pageIndex++) {
-        ctx.signal.throwIfAborted();
-        if (Date.now() + 1000 >= deadline) break;
-        const page = pageSchema.parse(
-          await options.source.fetchPage(next.position, ctx.signal, deadline),
-        );
-        const signature = stable(next.position);
-        if (next.positions.includes(signature))
-          throw serviceUnavailable('The source repeated a page position.', {
-            reason: 'pagination_invalid',
-            retryable: false,
-          });
-        next.positions.push(signature);
-        if (
-          page.next !== null &&
-          (stable(page.next) === signature || next.positions.includes(stable(page.next)))
-        )
-          throw serviceUnavailable('The source returned a repeated pagination position.', {
-            reason: 'pagination_invalid',
-            retryable: false,
-          });
-        for (const row of page.records) {
-          const id = z.string().min(1).parse(identify(row));
-          const shard = (createHash('sha256').update(id).digest()[0] ?? 0) % 64;
-          let ids = affected.get(shard);
-          if (!ids) {
-            const key = next.indexes[shard];
-            const stored = key ? indexSchema.safeParse(await readJson(ctx, key)) : undefined;
-            if (stored && !stored.success) throw invalidCursor();
-            ids = new Set(stored?.data ?? []);
-            affected.set(shard, ids);
-          }
-          if (ids.has(id)) continue;
-          ids.add(id);
-          changedShards.add(shard);
-          next.coverage.unique_records++;
-          fetched.push(row);
-          if (!next.retainAll && (!options.matches || options.matches(row))) next.pending.push(row);
+    // Retained scans hold nothing pending, so they always fetch up to maxPages while collecting.
+    for (
+      let pageIndex = 0;
+      pageIndex < maxPages && !next.coverage.complete && next.pending.length < pageSize;
+      pageIndex++
+    ) {
+      ctx.signal.throwIfAborted();
+      if (Date.now() + 1000 >= deadline) break;
+      const page = pageSchema.parse(
+        await options.source.fetchPage(next.position, ctx.signal, deadline),
+      );
+      const signature = stable(next.position);
+      if (next.positions.includes(signature))
+        throw serviceUnavailable('The source repeated a page position.', {
+          reason: 'pagination_invalid',
+          retryable: false,
+        });
+      next.positions.push(signature);
+      if (
+        page.next !== null &&
+        (stable(page.next) === signature || next.positions.includes(stable(page.next)))
+      )
+        throw serviceUnavailable('The source returned a repeated pagination position.', {
+          reason: 'pagination_invalid',
+          retryable: false,
+        });
+      for (const row of page.records) {
+        const id = z.string().min(1).parse(options.source.identify(row));
+        const shard = (createHash('sha256').update(id).digest()[0] ?? 0) % 64;
+        let ids = affected.get(shard);
+        if (!ids) {
+          const key = next.indexes[shard];
+          const stored = key ? indexSchema.safeParse(await readJson(ctx, key)) : undefined;
+          if (stored && !stored.success) throw invalidCursor();
+          ids = new Set(stored?.data ?? []);
+          affected.set(shard, ids);
         }
-        next.coverage.pages_fetched++;
-        next.coverage.records_fetched += page.records.length;
-        const partition = page.partition ?? { index: 0, total: 1 };
-        next.partitions ??= { total: partition.total, observed: Object.create(null) };
-        if (next.partitions.total !== partition.total)
-          throw serviceUnavailable('The source partition scope changed.', {
-            reason: 'pagination_invalid',
-            retryable: false,
-          });
-        const previous = next.partitions.observed[String(partition.index)];
-        next.partitions.observed[String(partition.index)] = {
-          ...(page.upstreamCount !== undefined ? { count: page.upstreamCount } : {}),
-          recordsFetched: (previous?.recordsFetched ?? 0) + page.records.length,
-          completeHistory:
-            previous?.completeHistory ?? page.partition?.firstPage ?? next.position === null,
-        };
-        const observed = Object.values(next.partitions.observed);
-        if (
-          observed.length === partition.total &&
-          observed.every((entry) => entry.count !== undefined)
-        )
-          next.coverage.upstream_count = observed.reduce(
-            (sum, entry) => sum + (entry.count ?? 0),
-            0,
-          );
-        else delete next.coverage.upstream_count;
-        next.position = page.next;
-        if (page.next === null) {
-          next.coverage.complete = true;
-          next.coverage.finished_at = new Date().toISOString();
-        }
-        // Once a response cannot deliver its entire tail, no more upstream work starts.
-        if (
-          !next.retainAll &&
-          fullResultBytes(
-            options.buildResponse(
-              {
-                records: next.pending,
-                record_handles: [],
-                records_deferred: 0,
-                records_returned: next.pending.length,
-                output_complete: false,
-                truncated: true,
-                coverage: { ...next.coverage, next_cursor: next.cursor },
-                cursor_expires_at: new Date(next.expires).toISOString(),
-                offset: next.delivered,
-                next_cursor: next.cursor,
-              },
-              next.finalMetadata,
-              next.provenance,
-            ),
-          ) > FULL_RESULT_TARGET_BYTES
-        )
-          break;
+        if (ids.has(id)) continue;
+        ids.add(id);
+        changedShards.add(shard);
+        next.coverage.unique_records++;
+        fetched.push(row);
+        if (!next.retainAll && (!options.matches || options.matches(row))) next.pending.push(row);
+      }
+      next.coverage.pages_fetched++;
+      next.coverage.records_fetched += page.records.length;
+      const partition = page.partition ?? { index: 0, total: 1 };
+      next.partitions ??= { total: partition.total, observed: Object.create(null) };
+      if (next.partitions.total !== partition.total)
+        throw serviceUnavailable('The source partition scope changed.', {
+          reason: 'pagination_invalid',
+          retryable: false,
+        });
+      const previous = next.partitions.observed[String(partition.index)];
+      next.partitions.observed[String(partition.index)] = {
+        ...(page.upstreamCount !== undefined ? { count: page.upstreamCount } : {}),
+        recordsFetched: (previous?.recordsFetched ?? 0) + page.records.length,
+        completeHistory:
+          previous?.completeHistory ?? page.partition?.firstPage ?? next.position === null,
+      };
+      const observed = Object.values(next.partitions.observed);
+      if (
+        observed.length === partition.total &&
+        observed.every((entry) => entry.count !== undefined)
+      )
+        next.coverage.upstream_count = observed.reduce((sum, entry) => sum + (entry.count ?? 0), 0);
+      else delete next.coverage.upstream_count;
+      next.position = page.next;
+      if (page.next === null) {
+        next.coverage.complete = true;
+        next.coverage.finished_at = new Date().toISOString();
       }
     }
     if (next.retainAll && fetched.length) {
-      for (let offset = 0; offset < fetched.length; offset += 125) {
-        const key = `acquisition/chunk/${next.id}/${next.revision}/${offset / 125}`;
-        await writeJson(ctx, key, fetched.slice(offset, offset + 125), next.expires);
+      for (let offset = 0; offset < fetched.length; offset += CHUNK_ROWS) {
+        const key = `acquisition/chunk/${next.id}/${next.revision}/${offset / CHUNK_ROWS}`;
+        await writeJson(ctx, key, fetched.slice(offset, offset + CHUNK_ROWS), next.expires);
         next.chunks.push(key);
       }
     }
@@ -391,26 +356,10 @@ export async function acquire(ctx: Context, options: AcquireOptions): Promise<Ac
       await materializeFinal(ctx, next, finalized.records);
       if (finalized.metadata) next.finalMetadata = objectSchema.parse(finalized.metadata);
     }
-    const delivery = next.finalChunks
-      ? await finalWindow(ctx, next, {
-          identify:
-            options.identifyFinal ??
-            ((row) => createHash('sha256').update(stable(row)).digest('hex')),
-          provenance: windowProvenance(next),
-          buildResponse: options.buildResponse,
-        })
-      : await windowRows(ctx, next, {
-          records: next.pending,
-          identify,
-          provenance: windowProvenance(next),
-          buildResponse: options.buildResponse,
-        });
-    if (next.finalChunks) next.finalOffset = (next.finalOffset ?? 0) + delivery.consumed;
-    else {
-      next.pending = next.pending.slice(delivery.consumed);
-      next.delivered += delivery.consumed;
-    }
-    next.replay = { cursor: incoming, response: JsonValueSchema.parse(delivery.response) };
+    const response = next.finalChunks
+      ? await finalWindow(ctx, next, options.buildResponse, pageSize)
+      : pendingWindow(next, options.buildResponse, pageSize);
+    next.replay = { cursor: incoming, response: JsonValueSchema.parse(response) };
     await writeJson(ctx, manifestKey(next.id), ManifestSchema.parse(next), next.expires);
     // Cleanup follows publication: failure must not turn a committed response into a failed advancement.
     for (const key of replaced) {
@@ -423,7 +372,7 @@ export async function acquire(ctx: Context, options: AcquireOptions): Promise<Ac
         });
       }
     }
-    return { response: delivery.response, checkpoint: checkpoint(next) };
+    return { response, checkpoint: checkpoint(next) };
   });
 }
 /** Resolve original normalized filters/mode before constructing a source callback on continuation. */
@@ -471,67 +420,31 @@ async function materializeFinal(
     ctx.signal.throwIfAborted();
     records.push(JsonValueSchema.parse(row));
     count++;
-    if (records.length === 125) await flush();
+    if (records.length === CHUNK_ROWS) await flush();
   }
   if (records.length) await flush();
   manifest.finalChunks = keys;
   manifest.finalCount = count;
   manifest.finalOffset = 0;
 }
-async function finalWindow(
-  ctx: Context,
-  manifest: Manifest,
-  options: {
-    identify: (record: JsonValue) => string;
-    provenance: Record<string, JsonValue>;
-    buildResponse: ResponseBuilder;
-    maxRecords?: number;
-  },
-): Promise<{ response: object; consumed: number }> {
-  const offset = manifest.finalOffset;
-  const total = manifest.finalCount;
-  if (offset === undefined || total === undefined || !manifest.finalChunks) throw invalidCursor();
-  const key = manifest.finalChunks[Math.floor(offset / 125)];
-  const chunk = key ? rowsSchema.safeParse(await readJson(ctx, key)) : undefined;
-  if (chunk && !chunk.success) throw invalidCursor();
-  if (!key && offset < total) throw invalidCursor();
-  const remaining = (chunk?.data ?? []).slice(
-    offset % 125,
-    options.maxRecords === undefined ? undefined : (offset % 125) + options.maxRecords,
-  );
-  return windowRows(ctx, manifest, {
-    records: remaining,
-    identify: options.identify,
-    provenance: options.provenance,
-    buildResponse: options.buildResponse,
-    total,
-    offset,
-    forceCursor: offset + remaining.length < total,
-  });
-}
-/** Finalized arrays use the same bounded windows without acquiring or truncating more source data. */
+/** Finalized arrays use the same count-bounded windows without acquiring more source data. */
 export interface ServeResultsOptions {
   buildResponse: ResponseBuilder;
   cursor?: string;
   filters?: Record<string, JsonValue>;
-  identify: (record: JsonValue) => string;
-  maxRecords?: number;
+  /** Whole records per window; a fixed window passes the same constant on every call. */
+  pageSize: number;
   provenance: Record<string, JsonValue>;
   records?: JsonValue[];
   scanKind: string;
   tool: string;
 }
-/** Materialize immutable final chunks once, then page with exact totals and deferred-parent support. */
+/** Materialize immutable final chunks once, then page whole records with exact totals. */
 export async function serveResults(
   ctx: Context,
   options: ServeResultsOptions,
 ): Promise<AcquisitionResult> {
-  const maxRecords = z
-    .number()
-    .int()
-    .min(1)
-    .max(125)
-    .parse(options.maxRecords ?? 25);
+  const pageSize = pageSizeSchema.parse(options.pageSize);
   const manifest = options.cursor
     ? await load(ctx, options.cursor, options.tool, options.scanKind, options.filters)
     : initial(options);
@@ -563,14 +476,9 @@ export async function serveResults(
         finished_at: new Date().toISOString(),
       };
     }
-    const delivery = await finalWindow(ctx, next, {
-      ...options,
-      maxRecords,
-      provenance: windowProvenance(next),
-    });
-    next.finalOffset = (next.finalOffset ?? 0) + delivery.consumed;
-    next.replay = { cursor: incoming, response: JsonValueSchema.parse(delivery.response) };
+    const response = await finalWindow(ctx, next, options.buildResponse, pageSize);
+    next.replay = { cursor: incoming, response: JsonValueSchema.parse(response) };
     await writeJson(ctx, manifestKey(next.id), ManifestSchema.parse(next), next.expires);
-    return { response: delivery.response, checkpoint: checkpoint(next) };
+    return { response, checkpoint: checkpoint(next) };
   });
 }

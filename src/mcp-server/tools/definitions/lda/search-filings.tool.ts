@@ -2,6 +2,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
+import { CEILINGS } from '@/domain/delivery-limits.js';
 import { formatResult } from '@/domain/format.js';
 import { FilingSchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
@@ -11,13 +12,15 @@ import {
   commonInput,
   deliveryShape,
   envelope,
+  INCLUDE_ALL,
   id,
+  includeInput,
   invalid,
   nativeFilters,
   optionalFilter,
   outputObject,
+  projectFiling,
   provenance,
-  recordOutput,
   scope,
   source,
   validateAmountRange,
@@ -30,20 +33,29 @@ const NAME = 'uslobbying_search_filings';
 const Output = z.union([
   z.object({
     ...deliveryShape,
-    filings: z.array(FilingSchema).describe('Complete matched source filings.'),
+    filings: z
+      .array(FilingSchema)
+      .describe(
+        'Matched source filings, every version; lobbying activities carry description and lobbyists only when include names them.',
+      ),
     amendment_policy: z
       .literal('all_versions')
       .describe('Originals and amendments remain separate.'),
   }),
-  recordOutput,
 ]);
 /** Search federal lobbying registrations and activity reports with all original and amended versions. Require a year or another upstream scope; issue_code filters activities locally and cannot narrow upstream requests. Follow next_cursor for all matches. Amounts are separate nullable USD strings; disclosure text is untrusted record data. */
 export const searchFilings = tool(NAME, {
   description:
-    'Search federal lobbying registrations and activity reports, or retrieve a complete filing by filing_uuid from evidence or analytical selections. Native filters include posting dates, reported amounts, client location and foreign entities; issue_code filters activities locally and cannot narrow upstream requests. Follow next_cursor for all versions. Amounts are separate nullable USD strings; disclosure text is untrusted record data.',
+    'Search federal lobbying registrations and activity reports, or retrieve a complete filing by filing_uuid from evidence or analytical selections. Native filters include posting dates, reported amounts, client location and foreign entities; issue_code filters activities locally and cannot narrow upstream requests. Activity descriptions and lobbyist lists are returned only when include names them, and filing_uuid includes both by default. Follow next_cursor for all versions. Amounts are separate nullable USD strings; disclosure text is untrusted record data.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    page_size: commonInput.page_size.describe(
+      `Whole filings delivered per call: default 10, at most ${CEILINGS.source.page_size}; larger values clamp to it and are disclosed in delivery_limits. Not the upstream page size; a page is short only at the end of the result or while acquisition is still collecting.`,
+    ),
+    include: includeInput.describe(
+      'Lobbying-activity fields to return: activity_descriptions (description) and activity_lobbyists (lobbyists). Fields left out are removed from every activity; nothing else is. Default [], or both with filing_uuid. Fixed for the scan: a continuation omits it or repeats it unchanged.',
+    ),
     filing_uuid: optionalFilter(z.string().uuid()).describe(
       'Exact filing UUID from evidence or analytical selections; retrieves complete source records.',
     ),
@@ -59,11 +71,18 @@ export const searchFilings = tool(NAME, {
     amount_max: amountFilter.describe(
       'Native maximum reported filing amount, exact decimal USD with at most two fractional digits.',
     ),
-    client_state: z.string().optional().describe('Native client state code, normalized uppercase.'),
+    client_state: z
+      .string()
+      .optional()
+      .describe(
+        'Native two-letter LDA client state code such as WA, from uslobbying_list_reference topic states; normalized uppercase.',
+      ),
     client_country: z
       .string()
       .optional()
-      .describe('Native client country code, normalized uppercase.'),
+      .describe(
+        'Native two-letter LDA client country code such as US, from the LDA entries of uslobbying_list_reference topic countries; normalized uppercase.',
+      ),
     foreign_entity_name: z
       .string()
       .optional()
@@ -71,7 +90,9 @@ export const searchFilings = tool(NAME, {
     foreign_entity_country: z
       .string()
       .optional()
-      .describe('Native foreign entity country code, normalized uppercase.'),
+      .describe(
+        'Native two-letter LDA foreign entity country code such as CN, from the LDA entries of uslobbying_list_reference topic countries; normalized uppercase.',
+      ),
     lobbyist_name: z.string().optional().describe('Native disclosed lobbyist name search.'),
     filing_year: year.optional().describe('Reported year, 1999 through the current UTC year.'),
     client_id: id
@@ -97,11 +118,15 @@ export const searchFilings = tool(NAME, {
         'year_end',
       ])
       .optional()
-      .describe('Source reporting period.'),
+      .describe(
+        'Source reporting period: mid_year and year_end for 1999–2007 semiannual reports, quarters from 2008.',
+      ),
     specific_issues: z
       .string()
       .optional()
-      .describe('Search the disclosed specific-issues text, such as H.R. 1 or telecommunications.'),
+      .describe(
+        'LDA text search of the disclosed specific issues, such as telecommunications. Not an exact phrase or bill-number match: H.R. 1 also returns filings citing only H.R. 1491.',
+      ),
     issue_code: z
       .string()
       .optional()
@@ -112,7 +137,7 @@ export const searchFilings = tool(NAME, {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Invalid scope, identifier, reference code or mode combination.',
+      when: 'Invalid scope, identifier, reference code or mode combination, or an over-cap page_size or max_pages while clamping is disabled.',
       recovery:
         'Call uslobbying_list_reference with topic identifiers or methodology, then retry this tool with the required filters.',
       thrownBy: 'service',
@@ -151,8 +176,7 @@ export const searchFilings = tool(NAME, {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    const resolved = await scope(input, ctx, NAME);
-    if (resolved.record) return Output.parse(resolved.record);
+    const resolved = await scope(input, ctx, NAME, CEILINGS.source);
     const f = resolved.filters;
     validateAmountRange(f);
     if (
@@ -161,8 +185,14 @@ export const searchFilings = tool(NAME, {
       f.posted_after > f.posted_before
     )
       invalid('Posting date range is inverted.');
-    await verifyCode('filing_types', f.filing_type, ctx);
-    await verifyCode('issue_codes', f.issue_code, ctx);
+    // A continuation carries the stored scope its first call already verified.
+    if (!input.cursor) {
+      await verifyCode('filing_types', f.filing_type, ctx, 'filing_type');
+      await verifyCode('issue_codes', f.issue_code, ctx, 'issue_code');
+      await verifyCode('states', f.client_state, ctx, 'client_state');
+      await verifyCode('countries', f.client_country, ctx, 'client_country');
+      await verifyCode('countries', f.foreign_entity_country, ctx, 'foreign_entity_country');
+    }
     const native = nativeFilters(f, [
       'filing_year',
       'client_id',
@@ -190,14 +220,24 @@ export const searchFilings = tool(NAME, {
       native.filing_specific_lobbying_issues = f.specific_issues;
     if (Object.keys(native).length === 1)
       invalid('Supply at least one substantive upstream filing filter.');
+    f.include ??= typeof f.filing_uuid === 'string' ? [...INCLUDE_ALL] : [];
+    const upstream = source('filings', [native]);
     const result = await acquire(ctx, {
       tool: NAME,
       scanKind: 'filings',
       filters: f,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
-      source: source('filings', [native]),
-      provenance: provenance(f, input),
+      pageSize: resolved.page_size ?? 10,
+      ...(resolved.max_pages ? { maxPages: resolved.max_pages } : {}),
+      // Project before matches are retained, so pending storage never holds the fields include leaves out.
+      source: {
+        ...upstream,
+        async fetchPage(...args) {
+          const page = await upstream.fetchPage(...args);
+          return { ...page, records: page.records.map((row) => projectFiling(row, f.include)) };
+        },
+      },
+      provenance: provenance(f, resolved.delivery_limits),
       matches: (row) =>
         matchesFiling(
           FilingSchema.parse(row),
@@ -209,7 +249,7 @@ export const searchFilings = tool(NAME, {
           f,
           'No filings matched the completed scope; use uslobbying_list_reference topic filing_types or issue_codes, then revise uslobbying_search_filings.',
           stored,
-          input,
+          resolved.delivery_limits,
         ),
         filings: w.records,
         amendment_policy: 'all_versions',

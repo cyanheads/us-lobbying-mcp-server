@@ -2,6 +2,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
+import { CEILINGS } from '@/domain/delivery-limits.js';
 import { formatResult } from '@/domain/format.js';
 import { JsonValueSchema } from '@/domain/json.js';
 import { ContributionReportSchema } from '@/domain/lda.js';
@@ -17,7 +18,6 @@ import {
   nativeFilters,
   outputObject,
   provenance,
-  recordOutput,
   scope,
   source,
   validateAmountRange,
@@ -46,7 +46,6 @@ const Output = z.union([
     item_count_in_batch: z.number().int().describe('Items in returned complete parent lists.'),
     amendment_policy: z.literal('all_versions').describe('Amendments remain separate reports.'),
   }),
-  recordOutput,
 ]);
 /** Retrieve complete semiannual LD-203 reports, contributions, PAC relationships and certifications, preserving original and amended reports. Child predicates must match the same item; full parent contribution lists and matched_item_indexes remain available. Report counts are not donation counts and no cross-report donation total is inferred. */
 export const getContributions = tool(NAME, {
@@ -55,6 +54,9 @@ export const getContributions = tool(NAME, {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    page_size: commonInput.page_size.describe(
+      `Whole LD-203 reports delivered per call, each with its complete contribution list: default 10, at most ${CEILINGS.source.page_size}; larger values clamp to it and are disclosed in delivery_limits. Not the upstream page size; a page is short only at the end of the result or while acquisition is still collecting.`,
+    ),
     amount_min: amountFilter.describe(
       'Inclusive local same-item minimum exact decimal USD; complete parent lists remain available.',
     ),
@@ -91,7 +93,7 @@ export const getContributions = tool(NAME, {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Invalid scope, identifier, reference code or mode combination.',
+      when: 'Invalid scope, identifier, reference code or mode combination, or an over-cap page_size or max_pages while clamping is disabled.',
       recovery:
         'Call uslobbying_list_reference with topic identifiers or methodology, then retry this tool with the required filters.',
       thrownBy: 'service',
@@ -130,8 +132,7 @@ export const getContributions = tool(NAME, {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    const resolved = await scope(input, ctx, NAME);
-    if (resolved.record) return Output.parse(resolved.record);
+    const resolved = await scope(input, ctx, NAME, CEILINGS.source);
     const f = resolved.filters;
     validateAmountRange(f);
     if (typeof f.filing_year !== 'number') invalid('filing_year is required on the first call.');
@@ -141,7 +142,9 @@ export const getContributions = tool(NAME, {
       f.contribution_date_after > f.contribution_date_before
     )
       invalid('Contribution date range is inverted.');
-    await verifyCode('contribution_types', f.contribution_type, ctx);
+    // A continuation carries the stored scope its first call already verified.
+    if (!input.cursor)
+      await verifyCode('contribution_types', f.contribution_type, ctx, 'contribution_type');
     const parsed = ContributionPredicatesSchema.parse(f);
     const predicates: Record<string, string> = {};
     for (const [key, value] of Object.entries(parsed))
@@ -165,8 +168,9 @@ export const getContributions = tool(NAME, {
       scanKind: 'contributions',
       filters: f,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
-      provenance: provenance(f, input),
+      pageSize: resolved.page_size ?? 10,
+      ...(resolved.max_pages ? { maxPages: resolved.max_pages } : {}),
+      provenance: provenance(f, resolved.delivery_limits),
       source: {
         ...upstream,
         async fetchPage(...args) {
@@ -194,7 +198,7 @@ export const getContributions = tool(NAME, {
           f,
           'No LD-203 reports matched the completed scope; use uslobbying_list_reference topic contribution_types, then revise uslobbying_get_contributions.',
           stored,
-          input,
+          resolved.delivery_limits,
         ),
         reports: w.records,
         report_count_in_batch: w.records.length,

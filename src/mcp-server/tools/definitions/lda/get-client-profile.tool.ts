@@ -3,6 +3,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
+import { CEILINGS } from '@/domain/delivery-limits.js';
 import { formatResult } from '@/domain/format.js';
 import { ClientSchema } from '@/domain/lda.js';
 import { acquire } from '@/services/acquisition/acquisition-service.js';
@@ -12,10 +13,11 @@ import {
   deliveryShape,
   envelope,
   id,
+  includeInput,
   invalid,
+  LDA_PAGE_SIZE,
   outputObject,
   provenance,
-  recordOutput,
   scope,
   source,
   year,
@@ -23,7 +25,6 @@ import {
 
 const NAME = 'uslobbying_get_client_profile';
 const Output = z.union([
-  recordOutput,
   z.object({
     ...analyticalShape,
     mode: z.literal('profile').describe('Selected relationship analysis.'),
@@ -40,11 +41,17 @@ const Output = z.union([
 /** Resolve names before selecting client relationships for analysis. */
 export const getClientProfile = tool(NAME, {
   description:
-    'Resolve client relationship records by client_name in mode resolve (default), then use mode profile with explicit client_ids and years. Select candidates[].id, preserving secondary client_id as source data. IDs identify registrant relationships, not a verified corporate identity. Follow collecting cursors before interpreting separate income and expense ledgers. Typed rows preserve every audit filing; pass a selected filing UUID to uslobbying_search_filings for its complete record. Optional canvas datasets support SQL.',
+    'Resolve client relationship records by client_name in mode resolve (default), then use mode profile with explicit client_ids and years. Select candidates[].id, preserving secondary client_id as source data. IDs identify registrant relationships, not a verified corporate identity. Follow collecting cursors before interpreting separate income and expense ledgers. Typed rows preserve every audit filing; activity descriptions and lobbyist lists appear in them only when include names them, and a selected filing UUID passed to uslobbying_search_filings returns its complete record. Optional canvas datasets support SQL.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    page_size: commonInput.page_size.describe(
+      `Whole records delivered per call: candidates in resolve mode (default 25, at most ${CEILINGS.identities.page_size}), analytical rows in profile mode (default 25, at most ${CEILINGS.analytical.page_size}). Larger values clamp to the mode's ceiling and are disclosed in delivery_limits. Not the upstream page size; a page is short only at the end of the result or while acquisition is still collecting.`,
+    ),
     row_sets: rowSetsInput,
+    include: includeInput.describe(
+      'Profile mode only: lobbying-activity fields to return in selected_filings, raw_filings and activities, activity_descriptions (description) and activity_lobbyists (lobbyists). Fields left out are removed from delivered rows only; totals and SQL datasets are unaffected. Default []. Fixed for the scan: a continuation omits it or repeats it unchanged.',
+    ),
     mode: z
       .preprocess(
         (value) => (typeof value === 'string' ? value.trim().toLowerCase() || undefined : value),
@@ -74,15 +81,13 @@ export const getClientProfile = tool(NAME, {
     mode: z
       .enum(['resolve', 'profile'])
       .optional()
-      .describe(
-        'Client resolution or selected relationship analysis; absent on stored-record retrieval.',
-      ),
+      .describe('Client resolution or selected relationship analysis.'),
   }),
   errors: [
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Invalid scope, identifier, reference code or mode combination.',
+      when: 'Invalid scope, identifier, reference code or mode combination, or an over-cap page_size or max_pages while clamping is disabled.',
       recovery:
         'Call uslobbying_list_reference with topic identifiers or methodology, then retry this tool with the required filters.',
       thrownBy: 'service',
@@ -137,8 +142,9 @@ export const getClientProfile = tool(NAME, {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    const resolved = await scope(input, ctx, NAME);
-    if (resolved.record) return Output.parse(resolved.record);
+    const resolved = await scope(input, ctx, NAME, (filters) =>
+      filters.mode === 'profile' ? CEILINGS.analytical : CEILINGS.identities,
+    );
     const f = resolved.filters;
     const mode = f.mode ?? 'resolve';
     f.mode = mode;
@@ -148,7 +154,8 @@ export const getClientProfile = tool(NAME, {
         f.client_ids !== undefined ||
         f.years !== undefined ||
         f.canvas_id !== undefined ||
-        f.row_sets !== undefined
+        f.row_sets !== undefined ||
+        f.include !== undefined
       )
         invalid('Resolve mode accepts only client_name and pagination.');
       if (typeof f.client_name !== 'string') invalid('Resolve mode requires client_name.');
@@ -157,18 +164,17 @@ export const getClientProfile = tool(NAME, {
         scanKind: 'resolve',
         filters: f,
         ...(input.cursor ? { cursor: input.cursor } : {}),
-        ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
-        source: source('clients', [
-          { client_name: f.client_name, page_size: Number(f.page_size ?? 25) },
-        ]),
-        provenance: provenance(f, input),
+        pageSize: resolved.page_size ?? 25,
+        ...(resolved.max_pages ? { maxPages: resolved.max_pages } : {}),
+        source: source('clients', [{ client_name: f.client_name, page_size: LDA_PAGE_SIZE }]),
+        provenance: provenance(f, resolved.delivery_limits),
         buildResponse: (w, _metadata, stored) => ({
           ...envelope(
             w,
             f,
             'No client records matched; revise client_name in uslobbying_get_client_profile mode resolve.',
             stored,
-            input,
+            resolved.delivery_limits,
           ),
           mode: 'resolve',
           candidates: w.records,
@@ -187,8 +193,8 @@ export const getClientProfile = tool(NAME, {
     const partitions: Record<string, string | number | boolean>[] = [];
     for (const client_id of ids.data)
       for (const filing_year of years.data)
-        partitions.push({ client_id, filing_year, page_size: Number(f.page_size ?? 25) });
-    const result = await analyzeScope(ctx, NAME, f, input, partitions, (base) => ({
+        partitions.push({ client_id, filing_year, page_size: LDA_PAGE_SIZE });
+    const result = await analyzeScope(ctx, NAME, resolved, input.cursor, partitions, (base) => ({
       ...base,
       mode: 'profile',
       client_ids: ids.data,

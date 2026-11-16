@@ -1,23 +1,27 @@
-/** @fileoverview Snapshot FARA discovery and retained live-detail windows. @module mcp-server/tools/definitions/search-foreign-agents.tool */
-import { createHash } from 'node:crypto';
+/** @fileoverview FARA snapshot search and live registration detail in count-bounded pinned windows. @module mcp-server/tools/definitions/search-foreign-agents.tool */
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
+import { ProvenanceSchema } from '@/domain/contracts.js';
 import {
-  ProvenanceSchema,
-  RecordHandleSchema,
-  RecordWindowInputShape,
-  RecordWindowSchema,
-} from '@/domain/contracts.js';
-import { deliveryDisclosure, normalizeDelivery } from '@/domain/delivery-limits.js';
+  CEILINGS,
+  deliveryDisclosure,
+  normalizeDelivery,
+  recordClamps,
+} from '@/domain/delivery-limits.js';
 import { FaraRecordSchema } from '@/domain/fara.js';
 import { formatResult } from '@/domain/format.js';
-import { type JsonValue, JsonValueSchema, optionalText } from '@/domain/json.js';
+import { JsonValueSchema, optionalText } from '@/domain/json.js';
 import { resolveCheckpoint, serveResults } from '@/services/acquisition/acquisition-service.js';
-import { readRecordWindow } from '@/services/acquisition/record-window.js';
 import { getFaraService } from '@/services/fara/fara-service.js';
 
 const NAME = 'uslobbying_search_foreign_agents';
+/** Applied in code, never as a schema default, so a continuation that omits page_size keeps its scope. */
+const DEFAULT_PAGE_SIZE = 25;
+const Mode = z.enum(['search', 'detail']);
+const Entity = z.enum(['registrants', 'foreign_principals', 'short_forms']);
+const Detail = z.enum(['foreign_principals', 'short_forms', 'documents']);
+const Status = z.enum(['active', 'terminated', 'all']);
 const blankUnset = <T extends z.ZodType>(schema: T) =>
   z.preprocess((value) => (value === '' ? undefined : value), schema);
 const optionalMode = <T extends z.ZodType>(schema: T) =>
@@ -26,113 +30,74 @@ const optionalMode = <T extends z.ZodType>(schema: T) =>
     schema,
   );
 const scopeSchema = z.strictObject({
-  mode: optionalMode(z.enum(['search', 'detail']).optional()).describe(
+  mode: optionalMode(Mode.optional()).describe(
     'Search daily snapshots or fetch one registration detail collection; defaults to search.',
   ),
-  entity: optionalMode(z.enum(['registrants', 'foreign_principals']).optional()).describe(
-    'Search entity, default registrants; unavailable in detail mode.',
+  entity: optionalMode(Entity.optional()).describe(
+    'Search entity, default registrants; short_forms finds the individuals filed under a registration by first and last name. Unavailable in detail mode.',
   ),
   name_contains: z
     .string()
     .optional()
-    .describe('Search-only literal case-insensitive token-AND match over entity names.'),
+    .describe(
+      'Search-only literal case-insensitive token-AND match over entity names; a short-form name is its first and last name joined. Short-form hits are name matches only, with no identity across registrations or with LDA lobbyists.',
+    ),
   country: z
     .string()
     .optional()
     .describe('Exact represented country/location label, foreign-principal search only.'),
-  status: optionalMode(z.enum(['active', 'terminated', 'all']).optional()).describe(
-    'Selected entity status, default active; documents require all.',
+  status: optionalMode(Status.optional()).describe(
+    'Status of the selected record itself, default active; documents require all.',
   ),
   registration_number: blankUnset(z.string().trim().regex(/^\d+$/).optional()).describe(
     'Lossless digit-string registration number, required for detail mode.',
   ),
-  detail: optionalMode(
-    z.enum(['foreign_principals', 'short_forms', 'documents']).optional(),
-  ).describe('Detail collection, default foreign_principals; unavailable in search mode.'),
+  detail: optionalMode(Detail.optional()).describe(
+    'Detail collection, default foreign_principals; unavailable in search mode.',
+  ),
   page_size: z
     .number()
     .multipleOf(1)
     .min(1)
     .optional()
     .describe(
-      'Maximum records in one local output window; positive integers clamp to 25, default 25.',
+      'Whole records per window, default 25, at most 1,000; larger values clamp to 1,000 and are disclosed in delivery_limits. Part of the scope: omit it or repeat it unchanged on continuations.',
     ),
 });
 const output = ProvenanceSchema.extend({
   truncated: z
     .boolean()
-    .describe(
-      'More data is available through next_cursor, record_handles or record windows; no source data was discarded.',
-    ),
-  mode: z.enum(['search', 'detail']).optional().describe('Original acquisition mode.'),
-  entity: z
-    .enum(['registrants', 'foreign_principals'])
-    .optional()
-    .describe('Selected search entity.'),
-  detail: z
-    .enum(['foreign_principals', 'short_forms', 'documents'])
-    .optional()
-    .describe('Selected detail collection.'),
-  status: z
-    .enum(['active', 'terminated', 'all'])
-    .optional()
-    .describe('Effective selected entity status.'),
-  source_urls: z.array(z.string()).optional().describe('Official source URLs actually acquired.'),
-  records: z
-    .array(FaraRecordSchema)
-    .optional()
-    .describe('Complete normalized parent records delivered in this window.'),
+    .describe('More records remain through next_cursor; no source data was discarded.'),
+  mode: Mode.describe('Original acquisition mode.'),
+  entity: Entity.optional().describe('Selected search entity.'),
+  detail: Detail.optional().describe('Selected detail collection.'),
+  status: Status.describe('Effective selected entity status.'),
+  source_urls: z.array(z.string()).describe('Official source URLs actually acquired.'),
+  records: z.array(FaraRecordSchema).describe('Whole normalized records delivered in this window.'),
   total_matches: z
     .number()
     .int()
     .nonnegative()
-    .optional()
     .describe('Exact matched records in the pinned acquisition.'),
-  record_handles: z
-    .array(RecordHandleSchema)
-    .optional()
-    .describe('Retained oversized parents, excluded from full records delivered.'),
   records_returned: z
     .number()
     .int()
     .nonnegative()
-    .optional()
-    .describe('Full records delivered in this window.'),
-  records_deferred: z
-    .number()
-    .int()
-    .nonnegative()
-    .optional()
-    .describe('Oversized parents represented by handles.'),
-  offset: z
-    .number()
-    .int()
-    .nonnegative()
-    .optional()
-    .describe('Start position in the pinned result set.'),
-  output_complete: z
-    .boolean()
-    .optional()
-    .describe('Whether every matched parent has been delivered or deferred.'),
-  next_cursor: z.string().optional().describe('Opaque next local result window.'),
-  record_window: RecordWindowSchema.optional().describe(
-    'Exact recursive window of a retained parent.',
-  ),
+    .describe('Whole records delivered in this window.'),
+  offset: z.number().int().nonnegative().describe('Records delivered before this window.'),
+  output_complete: z.boolean().describe('Whether every matched record has been delivered.'),
+  next_cursor: z.string().optional().describe('Opaque continuation to the next window.'),
 });
 
 /** Filter complete daily snapshots once; continuation never re-fetches source data. */
 export const searchForeignAgentsTool = tool(NAME, {
   title: 'Search foreign agents',
   description:
-    'Search official FARA daily registrant or foreign-principal snapshots, or retrieve one registration principal, short-form or document collection. Follow cursors to pinned local windows; principal status differs from registrant status. Disclosure records do not establish wrongdoing or influence.',
+    "Search official FARA daily snapshots of registrants, foreign principals or short-form registrants, or fetch one registration's live foreign-principal, short-form or document collection. Short forms are the individuals working under a registration, searched by first and last name; a hit is a name match only and establishes no identity across registrations or with LDA lobbyists. Each call returns page_size whole records; follow next_cursor through the pinned result. Principal and short-form status differ from registrant status (registrant_status). Disclosure records do not establish wrongdoing or influence.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: scopeSchema.extend({
     cursor: blankUnset(z.string().min(1).optional()).describe(
       'Opaque continuation; original filters may be omitted or repeated unchanged.',
-    ),
-    ...RecordWindowInputShape,
-    record_handle: blankUnset(z.string().trim().min(1).optional()).describe(
-      'Opaque tenant/tool-bound deferred record handle; exclusive with source selectors and cursor.',
     ),
   }),
   output,
@@ -140,16 +105,17 @@ export const searchForeignAgentsTool = tool(NAME, {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Required detail identifier is absent, selectors conflict, or country/status is invalid.',
+      when: 'Required detail identifier is absent, selectors conflict, country/status is invalid, or page_size exceeds 1,000 where clamping is disabled.',
       recovery:
-        'Call uslobbying_list_reference with topic identifiers or methodology, then retry this tool with the required filters.',
+        'Call uslobbying_list_reference with topic identifiers or fara_rules, then retry this tool with the required filters.',
     },
     {
       reason: 'cursor_invalid',
       code: JsonRpcErrorCode.ValidationError,
       thrownBy: 'service',
-      when: 'Continuation or record handle is unavailable, expired or belongs to another scope.',
-      recovery: 'Restart the same tool with the original filters and omit cursor.',
+      when: 'Continuation is unavailable, expired, belongs to another tenant, or arrives with changed filters or page_size.',
+      recovery:
+        'Restart uslobbying_search_foreign_agents with the original filters and omit cursor.',
     },
     {
       reason: 'acquisition_storage_unavailable',
@@ -185,18 +151,11 @@ export const searchForeignAgentsTool = tool(NAME, {
       recovery:
         'Wait for retryAfter when present, then retry uslobbying_search_foreign_agents with the same filters and cursor.',
     },
-    {
-      reason: 'result_too_large',
-      code: JsonRpcErrorCode.ValidationError,
-      thrownBy: 'service',
-      when: 'Complete result metadata exceeds the response window.',
-      recovery: 'Narrow the source filters or select a deeper record_path, then retry this tool.',
-    },
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    const disclosure = deliveryDisclosure(input);
-    input = normalizeDelivery(input);
+    const { delivery_limits } = deliveryDisclosure(input, CEILINGS.fara);
+    input = normalizeDelivery(input, CEILINGS.fara);
     const supplied = scopeSchema.parse(
       Object.fromEntries(
         Object.entries(input).filter(([key]) => Object.hasOwn(scopeSchema.shape, key)),
@@ -207,31 +166,6 @@ export const searchForeignAgentsTool = tool(NAME, {
         .map(([key, value]) => [key, typeof value === 'string' ? optionalText(value) : value])
         .filter(([, value]) => value !== undefined),
     );
-    if (input.record_handle) {
-      if (Object.keys(normalized).length || input.cursor)
-        throw ctx.fail(
-          'invalid_filter',
-          'record_handle is exclusive with source selectors and cursor.',
-        );
-      return output.parse(
-        await readRecordWindow(ctx, {
-          ...input,
-          tool: NAME,
-          record_handle: input.record_handle,
-          buildResponse: (record_window, provenance) => ({
-            ...provenance,
-            ...disclosure,
-            record_window,
-            truncated: !record_window.complete,
-          }),
-        }),
-      );
-    }
-    if (input.record_path !== '' || input.record_offset !== 0 || input.record_limit !== 25)
-      throw ctx.fail(
-        'invalid_filter',
-        'record_path, record_offset and record_limit require record_handle.',
-      );
     const checkpoint = input.cursor
       ? await resolveCheckpoint(ctx, { tool: NAME, cursor: input.cursor })
       : undefined;
@@ -254,17 +188,20 @@ export const searchForeignAgentsTool = tool(NAME, {
       throw ctx.fail('invalid_filter', 'country requires a foreign_principals search.');
     if (detail === 'documents' && status !== 'all')
       throw ctx.fail('invalid_filter', 'Document collections require status all.');
+    // multipleOf(1) admits float noise such as 20.000000000000004; scope and window use the integer it denotes.
+    const pageSize = Math.round(scope.page_size ?? DEFAULT_PAGE_SIZE);
     const filters = z.record(z.string(), JsonValueSchema).parse({
       ...normalized,
       mode,
       status,
-      page_size: scope.page_size ?? 25,
+      page_size: pageSize,
       ...(entity && { entity }),
       ...(detail && { detail }),
       ...(scope.registration_number && { registration_number: scope.registration_number }),
       ...(scope.name_contains && { name_contains: scope.name_contains }),
       ...(scope.country && { country: scope.country }),
     });
+    if (!input.cursor) recordClamps(ctx, NAME, delivery_limits);
     const source = checkpoint
       ? undefined
       : mode === 'search'
@@ -289,7 +226,6 @@ export const searchForeignAgentsTool = tool(NAME, {
     const provenance = source
       ? z.record(z.string(), JsonValueSchema).parse({
           source: 'fara',
-          ...disclosure,
           effective_filters: filters,
           ...sourceMetadata,
           notices: [
@@ -308,13 +244,11 @@ export const searchForeignAgentsTool = tool(NAME, {
       ...(input.cursor && { cursor: input.cursor }),
       filters,
       provenance,
-      maxRecords: scope.page_size ?? 25,
+      pageSize,
       ...(source && { records: z.array(JsonValueSchema).parse(source.records) }),
-      identify: (record: JsonValue) =>
-        createHash('sha256').update(JSON.stringify(record)).digest('hex'),
       buildResponse: (window, _metadata, stored) => ({
         ...stored,
-        ...disclosure,
+        delivery_limits,
         mode,
         ...(entity && { entity }),
         ...(detail && { detail }),

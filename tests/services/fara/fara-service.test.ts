@@ -7,6 +7,7 @@ import {
   principal,
   registrant,
   settle,
+  shortForm,
   snapshotResponse,
   xmlResponse,
 } from './fixtures.js';
@@ -152,6 +153,63 @@ describe('complete XML snapshots', () => {
         );
     },
   );
+  it('normalizes every principal snapshot field and keeps its own listing when unjoined', async () => {
+    const { service, calls } = boundary((url) =>
+      url.pathname.includes('ForeignPrincipals')
+        ? snapshotResponse(
+            'foreign_principals',
+            principal('04', 'Synthetic principal', 'France', '01/01/2025'),
+          )
+        : snapshotResponse('registrants', registrant('05', 'Unrelated firm')),
+    );
+    const result = await settle(
+      service.search({ entity: 'foreign_principals', status: 'all' }, signal()),
+    );
+    expect(result.records).toEqual([
+      {
+        registration_number: '04',
+        name: 'Synthetic principal',
+        entity: 'foreign_principals',
+        status: 'terminated',
+        registration_date_raw: '2024-02-29T00:00:00',
+        termination_date_raw: '01/01/2025',
+        registration_date: '2024-02-29',
+        termination_date: '2025-01-01',
+        registrant_name: 'Synthetic firm',
+        country: 'France',
+        listing_url: 'https://efile.fara.gov/api/v1/Registrants/html/Terminated',
+        raw: {
+          Registration_number: '04',
+          Foreign_principal: 'Synthetic principal',
+          Registrant_name: 'Synthetic firm',
+          Country_location_represented: 'France',
+          FP_registration_date: '2024-02-29T00:00:00',
+          FP_termination_date: '01/01/2025',
+        },
+      },
+    ]);
+    expect(result.source_urls).toEqual([
+      'https://efile.fara.gov/bulk/zip/FARA_All_ForeignPrincipals.xml.zip',
+      'https://efile.fara.gov/bulk/zip/FARA_All_Registrants.xml.zip',
+    ]);
+    expect(calls).toHaveLength(2);
+  });
+  it.each([
+    [
+      'registrants',
+      '<ROW><Registration_Number>1</Registration_Number><Termination_Date></Termination_Date></ROW>',
+    ],
+    [
+      'foreign_principals',
+      '<ROW><Registration_number>1</Registration_number><FP_termination_date></FP_termination_date></ROW>',
+    ],
+  ] as const)('fails closed on a nameless %s row', async (entity, row) => {
+    const { service, calls } = boundary(() => snapshotResponse(entity, row));
+    await expect(settle(service.search({ entity }, signal()))).rejects.toMatchObject({
+      data: { reason: 'source_schema_changed' },
+    });
+    expect(calls).toHaveLength(1);
+  });
   it('does not fabricate normalized dates for invalid calendar days', async () => {
     const { service } = boundary(() =>
       snapshotResponse('registrants', registrant('1', 'Synthetic', '02/30/2024')),
@@ -159,6 +217,288 @@ describe('complete XML snapshots', () => {
     const result = await settle(service.search({ status: 'all' }, signal()));
     expect(result.records[0]?.termination_date_raw).toBe('02/30/2024');
     expect(result.records[0]).not.toHaveProperty('termination_date');
+  });
+});
+
+type Archive = 'registrants' | 'foreign_principals' | 'short_forms';
+const ZIP = (noun: string) => `https://efile.fara.gov/bulk/zip/FARA_All_${noun}.xml.zip`;
+function archive(url: URL): Archive {
+  return url.pathname.includes('ShortForms')
+    ? 'short_forms'
+    : url.pathname.includes('ForeignPrincipals')
+      ? 'foreign_principals'
+      : 'registrants';
+}
+/** Serve only the named snapshots; any other download is a test failure. */
+function snapshots(rows: Partial<Record<Archive, string>>) {
+  return boundary((url) => {
+    const kind = archive(url);
+    const selected = rows[kind];
+    if (selected === undefined) throw new Error(`Unexpected snapshot ${url.pathname}`);
+    return snapshotResponse(kind, selected);
+  });
+}
+const people =
+  shortForm('7108', {
+    first: 'Avery T',
+    last: 'Synthetica',
+    date: '04/15/2022',
+    termination: '05/11/2022',
+  }) +
+  shortForm('6103', {
+    first: 'Blair M.',
+    last: 'Synthetica',
+    date: '05/15/2012',
+    termination: '12/01/2014',
+  }) +
+  shortForm('5926', {
+    first: 'Avery T.',
+    last: 'Synthetica',
+    date: '04/01/2009',
+    termination: '12/31/2017',
+  }) +
+  shortForm('7795', { first: 'Casey', last: 'Othername', date: '11/12/2026' });
+const firms =
+  registrant('7108', 'Firm A', '05/11/2022') +
+  registrant('6103', 'Firm B', '12/01/2014') +
+  registrant('5926', 'Firm C', '12/31/2017') +
+  registrant('7795', 'Firm D');
+
+describe('short-form snapshot search', () => {
+  it('matches first and last names token-AND under the selected short-form status', async () => {
+    const { service, calls } = snapshots({ short_forms: people, registrants: firms });
+    const all = await settle(
+      service.search(
+        { entity: 'short_forms', name_contains: 'synthetica', status: 'all' },
+        signal(),
+      ),
+    );
+    expect(all.records.map((row) => row.registration_number)).toEqual(['7108', '6103', '5926']);
+    expect(all.records[0]).toEqual({
+      registration_number: '7108',
+      name: 'Avery T Synthetica',
+      first_name: 'Avery T',
+      last_name: 'Synthetica',
+      entity: 'short_forms',
+      status: 'terminated',
+      registration_date_raw: '04/15/2022',
+      termination_date_raw: '05/11/2022',
+      registration_date: '2022-04-15',
+      termination_date: '2022-05-11',
+      registrant_name: 'Synthetic firm 7108',
+      registrant_status: 'terminated',
+      listing_url: 'https://efile.fara.gov/api/v1/Registrants/html/Terminated',
+      raw: {
+        Short_form_termination_date: '05/11/2022',
+        Short_form_date: '04/15/2022',
+        Short_form_last_name: 'Synthetica',
+        Short_form_first_name: 'Avery T',
+        Registration_number: '7108',
+        Registration_date: '01/02/2020',
+        Registrant_name: 'Synthetic firm 7108',
+        Address_1: '1 Synthetic Way',
+      },
+    });
+    expect(all.records.every((row) => FaraRecordSchema.safeParse(row).success)).toBe(true);
+    expect(all.status).toBe('all');
+    expect(all.source_urls).toEqual([ZIP('ShortForms'), ZIP('Registrants')]);
+    expect(all.snapshot_source_urls).toEqual([ZIP('ShortForms'), ZIP('Registrants')]);
+    expect(all.notices).toEqual([
+      'FARA search uses complete daily snapshots; short-form status is independent of registrant status. Short-form matches are name matches and establish no identity across registrations or with LDA lobbyists.',
+    ]);
+    const active = await settle(
+      service.search({ entity: 'short_forms', name_contains: 'synthetica' }, signal()),
+    );
+    expect(active.status).toBe('active');
+    expect(active.records).toEqual([]);
+    for (const [query, expected] of [
+      ['avery synthetica', ['7108', '5926']],
+      ['  SYNTHETICA   Avery ', ['7108', '5926']],
+      ['bob synthetica', []],
+    ] as const)
+      expect(
+        (
+          await settle(
+            service.search(
+              { entity: 'short_forms', name_contains: query, status: 'all' },
+              signal(),
+            ),
+          )
+        ).records.map((row) => row.registration_number),
+      ).toEqual(expected);
+    expect(calls.map((call) => call.url.href)).toEqual([ZIP('ShortForms'), ZIP('Registrants')]);
+  });
+  it('never downloads the short-form snapshot for registrant or principal searches', async () => {
+    const { service, calls } = snapshots({
+      registrants: firms,
+      foreign_principals: principal('7108', 'Synthetic principal'),
+    });
+    await settle(service.search({ status: 'all' }, signal()));
+    await settle(service.search({ entity: 'foreign_principals', status: 'all' }, signal()));
+    expect(calls.map((call) => call.url.href)).toEqual([
+      ZIP('Registrants'),
+      ZIP('ForeignPrincipals'),
+    ]);
+  });
+  it('keeps nameless, partially named and duplicate rows as separate source rows', async () => {
+    const twin = shortForm('7267', { first: 'Dup', last: 'Twin', date: '05/05/2023' });
+    const { service } = snapshots({
+      short_forms:
+        shortForm('7426') +
+        shortForm('1676', { first: 'G.Example', date: '02/08/1967', termination: '12/31/1966' }) +
+        twin +
+        twin,
+      registrants: registrant('7426', 'Firm') + registrant('1676', 'Old firm', '01/01/1990'),
+    });
+    const all = await settle(service.search({ entity: 'short_forms', status: 'all' }, signal()));
+    expect(all.records.map((row) => row.registration_number)).toEqual([
+      '7426',
+      '1676',
+      '7267',
+      '7267',
+    ]);
+    const [nameless, partial, first, second] = all.records;
+    expect(nameless).toMatchObject({ name: '', status: 'active', registrant_status: 'active' });
+    expect(nameless).not.toHaveProperty('first_name');
+    expect(nameless).not.toHaveProperty('last_name');
+    expect(nameless).not.toHaveProperty('registration_date');
+    expect(partial).toMatchObject({
+      name: 'G.Example',
+      first_name: 'G.Example',
+      status: 'terminated',
+      registration_date: '1967-02-08',
+      termination_date: '1966-12-31',
+    });
+    expect(partial).not.toHaveProperty('last_name');
+    expect(second).toEqual(first);
+    for (const [query, expected] of [
+      ['twin', ['7267', '7267']],
+      ['example', ['1676']],
+    ] as const)
+      expect(
+        (
+          await settle(
+            service.search(
+              { entity: 'short_forms', name_contains: query, status: 'all' },
+              signal(),
+            ),
+          )
+        ).records.map((row) => row.registration_number),
+      ).toEqual(expected);
+  });
+  it('joins registrant status independently and omits it for an unjoined registration', async () => {
+    const { service } = snapshots({
+      short_forms:
+        shortForm('100', { first: 'Active', last: 'Person', date: '01/01/2020' }) +
+        shortForm('200', { first: 'Unjoined', last: 'Person', date: '01/01/2020' }),
+      registrants: registrant('100', 'Terminated firm', '01/01/2025'),
+    });
+    const [joined, unjoined] = (
+      await settle(service.search({ entity: 'short_forms', name_contains: 'person' }, signal()))
+    ).records;
+    expect(joined).toMatchObject({
+      status: 'active',
+      registrant_status: 'terminated',
+      listing_url: 'https://efile.fara.gov/api/v1/Registrants/html/Terminated',
+    });
+    expect(unjoined).toMatchObject({
+      status: 'active',
+      listing_url: 'https://efile.fara.gov/api/v1/Registrants/html/Active',
+    });
+    expect(unjoined).not.toHaveProperty('registrant_status');
+  });
+  it('rejects a country filter on short forms before any download', async () => {
+    const { service, calls } = snapshots({});
+    await expect(
+      service.search({ entity: 'short_forms', country: 'Canada' }, signal()),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
+    expect(calls).toEqual([]);
+  });
+  it('agrees with detail mode on the normalized short-form fields', async () => {
+    const live: Record<string, { arm: string; row: Record<string, unknown> }> = {
+      '7108': {
+        arm: 'Terminated',
+        row: {
+          REG_NUMBER: 7108,
+          SF_FIRST_NAME: 'Avery T',
+          SF_LAST_NAME: 'Synthetica',
+          SHORTFORM_DATE: '2022-04-15T00:00:00',
+          SF_TERM_DATE: '2022-05-11T00:00:00',
+          REGISTRANT_NAME: 'Synthetic firm 7108',
+          ZIP: 20008,
+        },
+      },
+      '1676': {
+        arm: 'Terminated',
+        row: {
+          REG_NUMBER: 1676,
+          SF_FIRST_NAME: 'G.Example',
+          SF_LAST_NAME: '',
+          SHORTFORM_DATE: '1967-02-08T00:00:00',
+          SF_TERM_DATE: '1966-12-31T00:00:00',
+        },
+      },
+      '7426': {
+        arm: 'Active',
+        row: { REG_NUMBER: 7426, SF_FIRST_NAME: '', SF_LAST_NAME: '', SHORTFORM_DATE: '' },
+      },
+    };
+    const { service } = boundary((url) => {
+      if (url.pathname.startsWith('/bulk/'))
+        return archive(url) === 'short_forms'
+          ? snapshotResponse(
+              'short_forms',
+              shortForm('7108', {
+                first: 'Avery T',
+                last: 'Synthetica',
+                date: '04/15/2022',
+                termination: '05/11/2022',
+              }) +
+                shortForm('1676', {
+                  first: 'G.Example',
+                  date: '02/08/1967',
+                  termination: '12/31/1966',
+                }) +
+                shortForm('7426'),
+            )
+          : snapshotResponse('registrants', registrant('7108', 'Firm', '05/11/2022'));
+      const [, , , , , arm, id] = url.pathname.split('/');
+      const entry = live[id ?? ''];
+      return Response.json({ ROWSET: entry && entry.arm === arm ? { ROW: entry.row } : '' });
+    });
+    const fields = [
+      'registration_number',
+      'name',
+      'first_name',
+      'last_name',
+      'status',
+      'registration_date',
+      'termination_date',
+    ] as const;
+    const pick = (row: Record<string, unknown> | undefined) =>
+      Object.fromEntries(fields.flatMap((key) => (row && key in row ? [[key, row[key]]] : [])));
+    const hits = (await settle(service.search({ entity: 'short_forms', status: 'all' }, signal())))
+      .records;
+    for (const hit of hits) {
+      const detail = await settle(
+        service.detail(
+          { detail: 'short_forms', registration_number: hit.registration_number, status: 'all' },
+          signal(),
+        ),
+      );
+      expect(detail.records).toHaveLength(1);
+      expect(pick(detail.records[0])).toEqual(pick(hit));
+      expect(detail.records[0]?.raw).toEqual(live[hit.registration_number]?.row);
+    }
+    expect(pick(hits[0])).toEqual({
+      registration_number: '7108',
+      name: 'Avery T Synthetica',
+      first_name: 'Avery T',
+      last_name: 'Synthetica',
+      status: 'terminated',
+      registration_date: '2022-04-15',
+      termination_date: '2022-05-11',
+    });
   });
 });
 
@@ -383,6 +723,37 @@ describe('live detail shapes', () => {
       expect(calls.every((call) => call.url.pathname.endsWith('/00012'))).toBe(true);
     },
   );
+  it.each(['foreign_principals', 'short_forms', 'documents'] as const)(
+    'reads %s text fields FARA sends as JSON numbers as their digits, keeping the numbers in raw',
+    async (detail) => {
+      // FARA's JSON writes an all-digit value as a number; registration 5926's documents carry REGISTRANT_NAME 5926.
+      const row =
+        detail === 'foreign_principals'
+          ? { REG_NUMBER: 5926, FP_NAME: 1234, REGISTRANT_NAME: 5926, COUNTRY_NAME: 7 }
+          : detail === 'short_forms'
+            ? { REG_NUMBER: 5926, SF_FIRST_NAME: 12, SF_LAST_NAME: 34, REGISTRANT_NAME: 5926 }
+            : {
+                REGISTRATION_NUMBER: 5926,
+                DOCUMENT_TYPE: 'Short-Form',
+                URL: 'https://efile.fara.gov/docs/numeric.pdf',
+                REGISTRANT_NAME: 5926,
+                SHORT_FORM_NAME: 56,
+              };
+      const { service } = boundary(() => Response.json({ ROWSET: { ROW: row } }));
+      const result = await settle(
+        service.detail({ detail, registration_number: '5926' }, signal()),
+      );
+      const [record] = result.records;
+      expect(record?.registrant_name).toBe('5926');
+      expect(record?.raw).toEqual(row);
+      expect(FaraRecordSchema.safeParse(record).success).toBe(true);
+      if (detail === 'foreign_principals')
+        expect(record).toMatchObject({ name: '1234', country: '7' });
+      if (detail === 'short_forms')
+        expect(record).toMatchObject({ first_name: '12', last_name: '34' });
+      if (detail === 'documents') expect(record?.short_form_name).toBe('56');
+    },
+  );
   it.each(['foreign_principals', 'short_forms'] as const)(
     'fetches both status arms for %s and records each arm accurately',
     async (detail) => {
@@ -407,6 +778,69 @@ describe('live detail shapes', () => {
       ]);
     },
   );
+  it('normalizes a principal arm termination date only where the arm carries one', async () => {
+    const terminated = {
+      REG_NUMBER: 7108,
+      FP_NAME: 'Synthetic principal',
+      FP_REG_DATE: '2022-04-15T00:00:00',
+      TERMINATION_DATE: '2022-05-11T00:00:00',
+      COUNTRY_NAME: 'SYNTHETICA',
+    };
+    const active = { REG_NUMBER: 7108, FP_NAME: 'Synthetic active principal' };
+    const { service } = boundary((url) =>
+      Response.json({
+        ROWSET: { ROW: url.pathname.includes('/Terminated/') ? terminated : active },
+      }),
+    );
+    const result = await settle(
+      service.detail({ registration_number: '7108', status: 'all' }, signal()),
+    );
+    expect(result.records[1]).toMatchObject({
+      status: 'terminated',
+      registration_date: '2022-04-15',
+      termination_date: '2022-05-11',
+      termination_date_raw: '2022-05-11T00:00:00',
+      raw: terminated,
+    });
+    expect(result.records[0]?.status).toBe('active');
+    expect(result.records[0]).not.toHaveProperty('termination_date');
+    expect(result.records[0]).not.toHaveProperty('termination_date_raw');
+  });
+  it('normalizes short-form SF_TERM_DATE and treats blank detail names as undisclosed', async () => {
+    const rows = [
+      {
+        REG_NUMBER: 7108,
+        SF_FIRST_NAME: 'Avery T',
+        SF_LAST_NAME: 'Synthetica',
+        SHORTFORM_DATE: '2022-04-15T00:00:00',
+        SF_TERM_DATE: '2022-05-11T00:00:00',
+      },
+      { REG_NUMBER: 7108, SF_FIRST_NAME: 'Mononym', SF_LAST_NAME: '', SHORTFORM_DATE: '' },
+      { REG_NUMBER: 7108, SF_FIRST_NAME: '', SF_LAST_NAME: '', SHORTFORM_DATE: '' },
+    ];
+    const { service } = boundary(() => Response.json({ ROWSET: { ROW: rows } }));
+    const result = await settle(
+      service.detail(
+        { detail: 'short_forms', registration_number: '7108', status: 'terminated' },
+        signal(),
+      ),
+    );
+    expect(result.records[0]).toMatchObject({
+      name: 'Avery T Synthetica',
+      first_name: 'Avery T',
+      last_name: 'Synthetica',
+      registration_date: '2022-04-15',
+      termination_date: '2022-05-11',
+      termination_date_raw: '2022-05-11T00:00:00',
+    });
+    expect(result.records[1]).toMatchObject({ name: 'Mononym', first_name: 'Mononym' });
+    expect(result.records[1]).not.toHaveProperty('last_name');
+    expect(result.records[2]).toMatchObject({ name: '', raw: rows[2] });
+    expect(result.records[2]).not.toHaveProperty('first_name');
+    expect(result.records[2]).not.toHaveProperty('last_name');
+    expect(result.records[2]).not.toHaveProperty('registration_date');
+    expect(result.records.every((row) => FaraRecordSchema.safeParse(row).success)).toBe(true);
+  });
   it.each(['foreign_principals', 'short_forms', 'documents'] as const)(
     'accepts ROWSET-empty %s without asserting registration absence',
     async (detail) => {
@@ -593,7 +1027,9 @@ describe('transport and shared snapshot lifetime', () => {
   });
   it('aborts the shared exchange when the final waiter cancels and leaves no cache', async () => {
     let exchange: AbortSignal | undefined;
+    let hold = true;
     const { service, calls } = boundary((_url, init) => {
+      if (!hold) return snapshotResponse('registrants', registrant('1', 'Fresh'));
       exchange = init?.signal ?? undefined;
       return new Promise((_resolve, reject) =>
         exchange?.addEventListener('abort', () => reject(exchange?.reason), { once: true }),
@@ -603,9 +1039,104 @@ describe('transport and shared snapshot lifetime', () => {
     const pending = service.search({}, controller.signal).catch((error) => error);
     await vi.advanceTimersByTimeAsync(0);
     controller.abort(new DOMException('Synthetic cancelled', 'AbortError'));
-    expect(await settle(pending)).toBe(controller.signal.reason);
+    // No fake time passes, so only the cancellation, never an exchange or call deadline, can abort it.
+    await vi.advanceTimersByTimeAsync(0);
     expect(exchange?.aborted).toBe(true);
+    expect(await settle(pending)).toBe(controller.signal.reason);
     expect(calls).toHaveLength(1);
+    hold = false;
+    expect((await settle(service.search({}, signal()))).records).toMatchObject([{ name: 'Fresh' }]);
+    expect(calls).toHaveLength(2);
+  });
+  it('caches the short-form snapshot for 24 hours and single-flights concurrent searches', async () => {
+    let revision = 1;
+    const { service, calls } = boundary((url) =>
+      archive(url) === 'short_forms'
+        ? snapshotResponse('short_forms', shortForm('1', { first: `Revision${revision}` }))
+        : snapshotResponse('registrants', registrant('1', 'Firm')),
+    );
+    const downloads = () => calls.filter((call) => archive(call.url) === 'short_forms').length;
+    const search = () => service.search({ entity: 'short_forms', status: 'all' }, signal());
+    const [first, concurrent] = await settle(Promise.all([search(), search()]));
+    expect(concurrent).toEqual(first);
+    expect(calls).toHaveLength(2);
+    revision = 2;
+    const retrievedAt = Date.parse(first.snapshot_retrieved_at ?? '');
+    vi.setSystemTime(retrievedAt + 86_400_000 - 1);
+    expect((await settle(search())).records[0]?.name).toBe('Revision1');
+    expect(downloads()).toBe(1);
+    vi.setSystemTime(retrievedAt + 86_400_000);
+    expect((await settle(search())).records[0]?.name).toBe('Revision2');
+    expect(downloads()).toBe(2);
+  });
+  it.each([
+    [
+      'an unavailable download',
+      () => new Response('missing', { status: 404 }),
+      'snapshot_unavailable',
+    ],
+    [
+      'a malformed archive',
+      () => xmlResponse('ShortForms', '<SHORTFORM_REGISTRANTS><ROW></SHORTFORM_REGISTRANTS>'),
+      'source_schema_changed',
+    ],
+    [
+      'a wrong root element',
+      () => xmlResponse('ShortForms', `<REGISTRANTS>${registrant('1', 'Firm')}</REGISTRANTS>`),
+      'source_schema_changed',
+    ],
+  ] as const)('never caches %s of the short-form snapshot', async (_label, failure, reason) => {
+    let failing = true;
+    const { service, calls } = boundary((url) =>
+      archive(url) !== 'short_forms'
+        ? snapshotResponse('registrants', registrant('1', 'Firm'))
+        : failing
+          ? failure()
+          : snapshotResponse('short_forms', shortForm('1', { first: 'Recovered' })),
+    );
+    await expect(
+      settle(service.search({ entity: 'short_forms', status: 'all' }, signal())),
+    ).rejects.toMatchObject({ data: { reason } });
+    failing = false;
+    expect(
+      (await settle(service.search({ entity: 'short_forms', status: 'all' }, signal()))).records,
+    ).toMatchObject([{ name: 'Recovered' }]);
+    expect(calls.map((call) => archive(call.url))).toEqual([
+      'short_forms',
+      'short_forms',
+      'registrants',
+    ]);
+  });
+  it('does not let a cancelled short-form download poison the next search', async () => {
+    let hold = true;
+    const { service, calls } = boundary((url, init) => {
+      if (archive(url) !== 'short_forms')
+        return snapshotResponse('registrants', registrant('1', 'Firm'));
+      if (!hold) return snapshotResponse('short_forms', shortForm('1', { first: 'Fresh' }));
+      const exchange = init?.signal;
+      return new Promise((_resolve, reject) =>
+        exchange?.addEventListener('abort', () => reject(exchange.reason), { once: true }),
+      );
+    });
+    const controller = new AbortController();
+    const pending = service
+      .search({ entity: 'short_forms' }, controller.signal)
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(new DOMException('Synthetic cancelled', 'AbortError'));
+    // Checked before any fake time passes, so a deadline cannot stand in for the cancellation.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls[0]?.init?.signal?.aborted).toBe(true);
+    expect(await settle(pending)).toBe(controller.signal.reason);
+    hold = false;
+    expect(
+      (await settle(service.search({ entity: 'short_forms', status: 'all' }, signal()))).records,
+    ).toMatchObject([{ name: 'Fresh' }]);
+    expect(calls.map((call) => archive(call.url))).toEqual([
+      'short_forms',
+      'short_forms',
+      'registrants',
+    ]);
   });
   it('does not start I/O for an exhausted total deadline', async () => {
     const { service, calls } = boundary(() => Response.json({ ROWSET: '' }));
@@ -622,5 +1153,65 @@ describe('transport and shared snapshot lifetime', () => {
       controller.signal.reason,
     );
     expect(calls).toEqual([]);
+  });
+});
+
+describe('name scan cost over a cached snapshot', () => {
+  const ROWS = 2000;
+  const BASE_CHARS = 5_000;
+  /** Thread CPU per search, independent of how long a loaded machine deschedules the worker. */
+  const CPU_BUDGET_MS = 100;
+  const cpuMs = async (run: () => Promise<unknown>) => {
+    const start = process.threadCpuUsage();
+    await run();
+    const used = process.threadCpuUsage(start);
+    return (used.user + used.system) / 1000;
+  };
+  const least = async (runs: number, run: () => Promise<unknown>) => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let attempt = 0; attempt < runs; attempt++) best = Math.min(best, await cpuMs(run));
+    return best;
+  };
+  const shapes = [
+    [
+      'a multi-token query',
+      (n: number) => 'synthetica '.repeat(Math.ceil(n / 11)).slice(0, n),
+      320_000,
+    ],
+    ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`, 320_000],
+    ['line breaks throughout', (n: number) => '  \r\n'.repeat(n / 4), 320_000],
+    ['a long digit run', (n: number) => '1'.repeat(n), 320_000],
+  ] as const;
+  describe.each(['registrants', 'short_forms'] as const)('%s', (entity) => {
+    it.each(shapes)(
+      'grows linearly in name_contains length for %s',
+      async (_label, make, maxChars) => {
+        const ids = Array.from({ length: ROWS }, (_, index) => String(index + 1));
+        const { service } = snapshots({
+          registrants: ids.map((id) => registrant(id, `Synthetica firm ${id}`)).join(''),
+          short_forms: ids
+            .map((id) => shortForm(id, { first: `Person${id}`, last: 'Synthetica' }))
+            .join(''),
+        });
+        await settle(service.search({ entity, status: 'all' }, signal()));
+        const measure = (text: string) =>
+          least(5, () => service.search({ entity, status: 'all', name_contains: text }, signal()));
+        const small = make(BASE_CHARS);
+        for (let size = BASE_CHARS * 2; size <= maxChars; size *= 2) {
+          const large = make(size);
+          let growth = Number.POSITIVE_INFINITY;
+          let largest = Number.POSITIVE_INFINITY;
+          for (let pair = 0; pair < 3; pair++) {
+            const smallMs = await measure(small);
+            const largeMs = await measure(large);
+            growth = Math.min(growth, largeMs / Math.max(smallMs, 0.05));
+            largest = Math.min(largest, largeMs);
+          }
+          expect(largest, `${size} characters`).toBeLessThan(CPU_BUDGET_MS);
+          expect(growth, `${size} characters`).toBeLessThan(4 * (size / BASE_CHARS));
+        }
+      },
+      120_000,
+    );
   });
 });

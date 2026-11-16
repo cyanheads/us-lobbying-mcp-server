@@ -7,13 +7,14 @@ import { vi } from 'vitest';
 export function latin1(text: string): Uint8Array {
   return new Uint8Array(Buffer.from(text, 'latin1'));
 }
+const ARCHIVES = {
+  registrants: { noun: 'Registrants', root: 'REGISTRANTS' },
+  foreign_principals: { noun: 'ForeignPrincipals', root: 'FOREIGNPRINCIPALS' },
+  short_forms: { noun: 'ShortForms', root: 'SHORTFORM_REGISTRANTS' },
+} as const;
 /** Package a selected complete XML snapshot; CSV is deliberately unusable. */
-export function snapshotResponse(
-  kind: 'registrants' | 'foreign_principals',
-  rows: string,
-): Response {
-  const noun = kind === 'registrants' ? 'Registrants' : 'ForeignPrincipals';
-  const root = kind === 'registrants' ? 'REGISTRANTS' : 'FOREIGNPRINCIPALS';
+export function snapshotResponse(kind: keyof typeof ARCHIVES, rows: string): Response {
+  const { noun, root } = ARCHIVES[kind];
   return xmlResponse(noun, `<${root}>${rows}</${root}>`);
 }
 /** Build a tiny real ZIP with the required XML member and misleading CSV. */
@@ -35,6 +36,15 @@ export function registrant(id: string, name: string, termination = '', extra = '
 /** Principal status belongs to the principal, independently of the registrant. */
 export function principal(id: string, name: string, country = 'Canada', termination = ''): string {
   return `<ROW><Registration_number>${id}</Registration_number><Foreign_principal>${name}</Foreign_principal><Registrant_name>Synthetic firm</Registrant_name><Country_location_represented>${country}</Country_location_represented><FP_registration_date>2024-02-29T00:00:00</FP_registration_date><FP_termination_date>${termination}</FP_termination_date></ROW>`;
+}
+/** Short-form row with the source's indentation; an omitted part is absent from the row, as in the snapshot. */
+export function shortForm(
+  id: string,
+  parts: { first?: string; last?: string; date?: string; termination?: string } = {},
+): string {
+  const element = (key: string, value: string | undefined) =>
+    value === undefined ? '' : `\n    <${key}>${value}</${key}>`;
+  return `\n  <ROW>${element('Short_form_termination_date', parts.termination)}${element('Short_form_date', parts.date)}${element('Short_form_last_name', parts.last)}${element('Short_form_first_name', parts.first)}\n    <Registration_number>${id}</Registration_number>\n    <Registration_date>01/02/2020</Registration_date>\n    <Registrant_name>Synthetic firm ${id}</Registrant_name>\n    <Address_1>1 Synthetic Way</Address_1>\n  </ROW>`;
 }
 /** Observe rejection immediately, then advance only fake scheduler time. */
 export async function settle<T>(pending: Promise<T>): Promise<T> {

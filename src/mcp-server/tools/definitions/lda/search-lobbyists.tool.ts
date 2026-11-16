@@ -2,6 +2,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { withToolDeadline } from '@/config/tool-deadline.js';
+import { CEILINGS } from '@/domain/delivery-limits.js';
 import { formatResult } from '@/domain/format.js';
 import { type JsonValue, JsonValueSchema } from '@/domain/json.js';
 import {
@@ -17,11 +18,12 @@ import {
   deliveryShape,
   envelope,
   id,
+  includeInput,
   invalid,
   nativeFilters,
   outputObject,
+  projectActivity,
   provenance,
-  recordOutput,
   scope,
   source,
   year,
@@ -42,7 +44,9 @@ const Evidence = z
     activity_index: z.number().int().describe('Original activity index.'),
     lobbyist_index: z.number().int().describe('Original participant index.'),
     general_issue_code: z.string().describe('Activity issue code.'),
-    activity: LobbyingActivitySchema.describe('Complete matched activity.'),
+    activity: LobbyingActivitySchema.describe(
+      'Matched activity; description and its lobbyist list appear only when include names them.',
+    ),
   })
   .catchall(JsonValueSchema)
   .describe('Complete filing-scoped lobbyist evidence.');
@@ -59,15 +63,20 @@ const Output = z.union([
       .optional()
       .describe('Matched filing-based participant evidence in activity mode.'),
   }),
-  recordOutput,
 ]);
 /** Find identities before requesting filing-scoped covered-position evidence. */
 export const searchLobbyists = tool(NAME, {
   description:
-    'Find lobbyists by name or registrant in mode search, then retrieve filing-scoped evidence with mode activity, lobbyist_id and filing_year. Pass an evidence filing_uuid to uslobbying_search_filings for the complete filing. Covered positions are disclosed text, not verified present employment. Activity mode checks the requested lobbyist locally. Follow next_cursor for all results.',
+    'Find lobbyists by name or registrant in mode search, then retrieve filing-scoped evidence with mode activity, lobbyist_id and filing_year. Pass an evidence filing_uuid to uslobbying_search_filings for the complete filing. Covered positions are disclosed text, not verified present employment. Activity mode checks the requested lobbyist locally; evidence activities carry description and lobbyist lists only when include names them. Follow next_cursor for all results.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.strictObject({
     ...commonInput,
+    page_size: commonInput.page_size.describe(
+      `Whole records delivered per call: identities in search mode (default 25, at most ${CEILINGS.identities.page_size}), evidence rows in activity mode (default 25, at most ${CEILINGS.evidence.page_size}). Larger values clamp to the mode's ceiling and are disclosed in delivery_limits. Not the upstream page size; a page is short only at the end of the result or while acquisition is still collecting.`,
+    ),
+    include: includeInput.describe(
+      'Activity mode only: lobbying-activity fields to return in evidence[].activity, activity_descriptions (description) and activity_lobbyists (lobbyists). Fields left out are removed; nothing else is. Default []. Fixed for the scan: a continuation omits it or repeats it unchanged.',
+    ),
     mode: z
       .preprocess(
         (value) => (typeof value === 'string' ? value.trim().toLowerCase() || undefined : value),
@@ -96,7 +105,7 @@ export const searchLobbyists = tool(NAME, {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Invalid scope, identifier, reference code or mode combination.',
+      when: 'Invalid scope, identifier, reference code or mode combination, or an over-cap page_size or max_pages while clamping is disabled.',
       recovery:
         'Call uslobbying_list_reference with topic identifiers or methodology, then retry this tool with the required filters.',
       thrownBy: 'service',
@@ -135,8 +144,9 @@ export const searchLobbyists = tool(NAME, {
   ],
   async handler(input, ctx) {
     ctx = withToolDeadline(ctx);
-    const resolved = await scope(input, ctx, NAME);
-    if (resolved.record) return Output.parse(resolved.record);
+    const resolved = await scope(input, ctx, NAME, (filters) =>
+      filters.mode === 'activity' ? CEILINGS.evidence : CEILINGS.identities,
+    );
     const f = resolved.filters;
     const mode = f.mode ?? 'search';
     f.mode = mode;
@@ -146,9 +156,12 @@ export const searchLobbyists = tool(NAME, {
       (f.lobbyist_id !== undefined ||
         f.filing_year !== undefined ||
         f.client_id !== undefined ||
-        f.covered_positions_only !== undefined)
+        f.covered_positions_only !== undefined ||
+        f.include !== undefined)
     )
-      invalid('Activity selectors cannot be used in identity search.');
+      invalid(
+        'Activity selectors (lobbyist_id, filing_year, client_id, covered_positions_only, include) cannot be used in identity search.',
+      );
     if (
       mode === 'activity' &&
       (f.name !== undefined || f.registrant_name !== undefined || f.registrant_id !== undefined)
@@ -161,6 +174,7 @@ export const searchLobbyists = tool(NAME, {
       invalid('Activity mode requires lobbyist_id and filing_year.');
     if (mode === 'search' && !f.name && !f.registrant_name && !f.registrant_id)
       invalid('Search mode requires name or registrant scope.');
+    if (mode === 'activity') f.include ??= [];
     const native = nativeFilters(
       f,
       mode === 'search'
@@ -175,13 +189,15 @@ export const searchLobbyists = tool(NAME, {
       scanKind: mode,
       filters: f,
       ...(input.cursor ? { cursor: input.cursor } : {}),
-      ...(input.max_pages ? { maxPages: Math.min(input.max_pages, 5) } : {}),
-      provenance: provenance(f, input),
+      pageSize: resolved.page_size ?? 25,
+      ...(resolved.max_pages ? { maxPages: resolved.max_pages } : {}),
+      provenance: provenance(f, resolved.delivery_limits),
       source: upstream,
       ...(mode === 'activity'
         ? {
             retainAll: true,
             finalize({ chunks }: { chunks: AsyncIterable<JsonValue[]> }) {
+              // Evidence is found through the full participant list, then projected for delivery.
               async function* records() {
                 for await (const chunk of chunks)
                   for (const filing of chunk)
@@ -190,13 +206,15 @@ export const searchLobbyists = tool(NAME, {
                       String(f.lobbyist_id),
                       f.covered_positions_only === true,
                     ))
-                      yield JsonValueSchema.parse(evidence);
+                      yield JsonValueSchema.parse({
+                        ...evidence,
+                        activity: projectActivity(
+                          JsonValueSchema.parse(evidence.activity),
+                          f.include,
+                        ),
+                      });
               }
               return Promise.resolve({ records: records() });
-            },
-            identifyFinal: (row: JsonValue) => {
-              const r = Evidence.parse(row);
-              return JSON.stringify([r.filing_uuid, r.activity_index, r.lobbyist_index]);
             },
           }
         : {}),
@@ -206,7 +224,7 @@ export const searchLobbyists = tool(NAME, {
           f,
           'No lobbyist evidence matched the completed scope; use uslobbying_search_lobbyists mode search to resolve the name, then mode activity with its lobbyist_id and a filing_year.',
           stored,
-          input,
+          resolved.delivery_limits,
         ),
         mode,
         ...(mode === 'search' ? { lobbyists: w.records } : { evidence: w.records }),

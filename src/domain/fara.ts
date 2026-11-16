@@ -3,11 +3,14 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { IdSchema, JsonValueSchema, SourceIdSchema } from './json.js';
 
 const text = z.string().nullable().optional();
+/** FARA's JSON writes an all-digit value as a number; a source text field reads it as its digits. */
+const sourceString = z.union([z.string(), z.number().transform(String)]);
+const sourceText = sourceString.nullable().optional();
 const addressFields = {
-  ADDRESS_1: text.describe('Source address line one.'),
-  ADDRESS_2: text.describe('Source address line two.'),
-  CITY: text.describe('Source city.'),
-  STATE: text.describe('Source state.'),
+  ADDRESS_1: sourceText.describe('Source address line one.'),
+  ADDRESS_2: sourceText.describe('Source address line two.'),
+  CITY: sourceText.describe('Source city.'),
+  STATE: sourceText.describe('Source state.'),
   ZIP: z
     .union([z.string(), z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)])
     .nullable()
@@ -18,11 +21,12 @@ const addressFields = {
 export const FaraPrincipalWireSchema = z
   .object({
     REG_NUMBER: SourceIdSchema.describe('Registration number.'),
-    FP_NAME: z.string().describe('Foreign principal name.'),
-    REG_DATE: text.describe('Raw registrant date.'),
-    FP_REG_DATE: text.describe('Raw principal date.'),
-    REGISTRANT_NAME: text.describe('Registrant name.'),
-    COUNTRY_NAME: text.describe('Represented country/location label.'),
+    FP_NAME: sourceString.describe('Foreign principal name.'),
+    REG_DATE: sourceText.describe('Raw registrant date.'),
+    FP_REG_DATE: sourceText.describe('Raw principal date.'),
+    TERMINATION_DATE: sourceText.describe('Raw principal termination date; terminated arm only.'),
+    REGISTRANT_NAME: sourceText.describe('Registrant name.'),
+    COUNTRY_NAME: sourceText.describe('Represented country/location label.'),
     ...addressFields,
   })
   .catchall(JsonValueSchema);
@@ -30,11 +34,12 @@ export const FaraPrincipalWireSchema = z
 export const FaraShortFormWireSchema = z
   .object({
     REG_NUMBER: SourceIdSchema.describe('Registration number.'),
-    SF_FIRST_NAME: text.describe('Individual first name.'),
-    SF_LAST_NAME: z.string().describe('Individual last name.'),
-    SHORTFORM_DATE: text.describe('Raw short-form date.'),
-    REG_DATE: text.describe('Raw registrant date.'),
-    REGISTRANT_NAME: text.describe('Registrant name.'),
+    SF_FIRST_NAME: sourceText.describe('Individual first name.'),
+    SF_LAST_NAME: sourceString.describe('Individual last name, empty when undisclosed.'),
+    SHORTFORM_DATE: sourceText.describe('Raw short-form date.'),
+    SF_TERM_DATE: sourceText.describe('Raw short-form termination date; terminated arm only.'),
+    REG_DATE: sourceText.describe('Raw registrant date.'),
+    REGISTRANT_NAME: sourceText.describe('Registrant name.'),
     ...addressFields,
   })
   .catchall(JsonValueSchema);
@@ -44,11 +49,11 @@ export const FaraDocumentWireSchema = z
     REGISTRATION_NUMBER: SourceIdSchema.describe('Registration number.'),
     DOCUMENT_TYPE: z.string().describe('Source document type.'),
     URL: z.string().describe('Returned official document URL.'),
-    DATE_STAMPED: text.describe('Raw stamped date.'),
-    REGISTRANT_NAME: text.describe('Registrant name.'),
-    SHORT_FORM_NAME: text.describe('Related individual name.'),
-    FOREIGN_PRINCIPAL_NAME: text.describe('Related principal name.'),
-    FOREIGN_PRINCIPAL_COUNTRY: text.describe('Related principal country/location.'),
+    DATE_STAMPED: sourceText.describe('Raw stamped date.'),
+    REGISTRANT_NAME: sourceText.describe('Registrant name.'),
+    SHORT_FORM_NAME: sourceText.describe('Related individual name.'),
+    FOREIGN_PRINCIPAL_NAME: sourceText.describe('Related principal name.'),
+    FOREIGN_PRINCIPAL_COUNTRY: sourceText.describe('Related principal country/location.'),
   })
   .catchall(JsonValueSchema);
 /** Only verified detail envelope alternatives are accepted. */

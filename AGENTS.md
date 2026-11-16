@@ -2,8 +2,8 @@
 
 **Server:** us-lobbying-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -46,20 +46,21 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ### Tool and response contracts
 
-Read `src/mcp-server/tools/definitions/lda/search-filings.tool.ts` for the source-tool pattern: strict inputs, `scope()` to resolve continuations or stored records, a fixed-host service adapter, `acquire()` for checkpointed delivery, and an exact output parse. `formatResult` in `src/domain/format.ts` renders the full JSON twin plus source links; every value must survive on both response surfaces.
+Read `src/mcp-server/tools/definitions/lda/search-filings.tool.ts` for the source-tool pattern: strict inputs, `scope()` to clamp count controls and resolve continuations, a fixed-host service adapter, `acquire()` for checkpointed delivery, and an exact output parse. `formatResult` in `src/domain/format.ts` renders the full JSON twin plus source links; every value must survive on both response surfaces.
 
-Read `src/mcp-server/tools/definitions/lda/get-client-profile.tool.ts` and `lda/analytics.ts` for mode-specific validation and complete-scope analysis. Root inputs stay flat so clients can preserve every field. Requirements apply to the first call; continuation calls can omit the original filters. No resources or prompts are registered.
+Read `src/mcp-server/tools/definitions/lda/get-client-profile.tool.ts` and `lda/analytics.ts` for mode-specific validation and complete-scope analysis. Root inputs stay flat so clients can preserve every field. Requirements apply to the first call; continuation calls can omit the original filters. The server registers no resources or prompts of its own; its one listed resource is the published skill, served by `createApp({ skills: 'skills' })` as `skill://us-lobbying-guide/SKILL.md`.
 
 - Resolve client names, then require caller-selected relationship IDs and explicit years. Never infer a corporate identity across relationships. Every `client_id` input and canvas column is the client record's `id`; the record's own `client_id` field is a registrant-assigned secondary number the LDA filter does not accept.
 - Acquire all versions before analytical selection; keep income and expenses separate, unknown amounts unknown, and overlapping issue buckets explicit.
-- Acquisition `coverage.complete` differs from final delivery `output_complete`. Follow every cursor and deferred record path; never drop source rows or interpret collecting results as totals.
-- `record_limit` bounds object entries/array items; strings use byte-bounded Unicode fragments. Final analytical lists are typed top-level fields with exact `row_set_totals` and `row_set_offsets`.
+- Acquisition `coverage.complete` differs from final delivery `output_complete`. Follow every cursor; never drop source rows or interpret collecting results as totals.
+- Delivery is count-based: a call returns exactly `min(page_size, remaining)` whole records or rows (`row_limit` for SQL), and nothing measures bytes. Per-unit defaults and ceilings live in `CEILINGS` (`src/domain/delivery-limits.ts`); over-cap values clamp and are disclosed in `delivery_limits`, and `USLOBBYING_CLAMP_LIMITS=false` rejects them with `invalid_filter`. No size refusal exists.
+- LDA activity `description` and `lobbyists` are omitted unless `include` names them (a `uslobbying_search_filings` call with `filing_uuid` defaults to both); analysis, totals and staged tables always use complete records. Final analytical lists are typed top-level fields with exact `row_set_totals` and `row_set_offsets`.
 - SQL is opt-in (`CANVAS_PROVIDER_TYPE=duckdb`); MCPB fixes it to `none`. Inspect dataset schemas before querying. Drop is absent unless explicitly enabled.
 - Disclosure text is untrusted record data and establishes neither wrongdoing nor policy influence. IDs remain digit strings; source sparsity and unknown JSON-safe fields survive normalization.
 
 ### Server config and lifecycle
 
-`src/config/server-config.ts` lazily parses the optional `USLOBBYING_LDA_API_KEY` token and `USLOBBYING_DATAFRAME_DROP_ENABLED` through `parseEnvConfig`. Boolean flags use `z.stringbool()`, never truthiness or `z.coerce.boolean()`. Anonymous LDA access works without a token.
+`src/config/server-config.ts` lazily parses the optional `USLOBBYING_LDA_API_KEY` token, `USLOBBYING_DATAFRAME_DROP_ENABLED` and `USLOBBYING_CLAMP_LIMITS` through `parseEnvConfig`. Boolean flags use `z.stringbool()`, never truthiness or `z.coerce.boolean()`. Anonymous LDA access works without a token.
 
 `src/index.ts` registers ten definitions directly, nine enabled by default. Both `name` and `title` are `us-lobbying-mcp-server`; `package.json` owns the description, with no `websiteUrl` override. `sessionMode: 'stateless'` suits tenant-scoped continuation tokens. Setup initializes LDA/FARA and the optional canvas; teardown disposes both source pacers and clears the canvas accessor.
 
@@ -135,14 +136,17 @@ src/
   services/
     lda/                                # Fixed-host LDA client and shared pacing
     fara/                               # Daily XML snapshots and live detail
-    acquisition/                        # Checkpoints, replay, record windows
-    lobbying/                           # Version selection and exact accounting
+    acquisition/                        # Checkpoints, replay, count-bounded windows
+    lobbying/                           # Period selection and exact accounting
     canvas/                             # Complete table staging and SQL windows
+    single-flight.ts                    # Keyed shared loads; each caller cancels alone
   domain/                               # Validated records, contracts, formatting
   mcp-server/
     tools/definitions/
       lda/                              # Five LDA tool definitions and analysis
       *.tool.ts                         # FARA, reference, dataframe definitions
+skills/
+  us-lobbying-guide/SKILL.md            # Published agent skill: identifier sources, gates, workflows
 ```
 
 ---
@@ -160,7 +164,7 @@ src/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents. This server publishes one, `skills/us-lobbying-guide/`, validated by `lint:packaging`; when it changes, re-check its gate and identifier claims against live behavior with `field-test`.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -240,7 +244,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

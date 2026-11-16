@@ -36,12 +36,13 @@ export const provenance = ProvenanceSchema.parse({
   },
 });
 
-export async function fixture() {
+/** `memoryLimitMb` above 64 lets the engine run one thread per 64 MB, up to the host's cores. */
+export async function fixture({ memoryLimitMb = 64 }: { memoryLimitMb?: number } = {}) {
   const ctx = createMockContext();
   const provider = new DuckdbProvider({
     defaultRowLimit: 100,
     exportRootPath: '/tmp',
-    memoryLimitMb: 64,
+    memoryLimitMb,
     schemaSniffRows: 1,
   });
   const canvas = new DataCanvas(

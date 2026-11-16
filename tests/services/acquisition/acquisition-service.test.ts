@@ -1,7 +1,8 @@
-/** @fileoverview Acquisition persistence, replay, delivery and failure-boundary tests. @module tests/services/acquisition/acquisition-service */
+/** @fileoverview Acquisition persistence, replay, count-bounded delivery and failure-boundary tests. @module tests/services/acquisition/acquisition-service */
+import { Buffer } from 'node:buffer';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ACQUISITION_TTL_MS, type AcquisitionSource } from '../../../src/domain/contracts.js';
+import { ACQUISITION_TTL_MS } from '../../../src/domain/contracts.js';
 import { formatResult } from '../../../src/domain/format.js';
 import type { JsonValue } from '../../../src/domain/json.js';
 import {
@@ -19,14 +20,16 @@ const base = {
   scanKind: 'filings',
   filters: { year: 2025 },
   provenance: { source: 'lda' },
+  pageSize: 25,
   buildResponse,
 };
 const identify = (row: JsonValue): string =>
   String(row !== null && typeof row === 'object' && !Array.isArray(row) ? row.id : row);
-function source(pages: JsonValue[][]): AcquisitionSource<JsonValue> {
+/** A stub source serving each page in order; `next` is the following page index. */
+function source(pages: JsonValue[][]) {
   return {
     identify,
-    fetchPage: vi.fn(async (position) => {
+    fetchPage: vi.fn(async (position: JsonValue) => {
       const index = position === null ? 0 : Number(position);
       return { records: pages[index] ?? [], next: index + 1 < pages.length ? index + 1 : null };
     }),
@@ -40,16 +43,13 @@ async function collect(chunks: AsyncIterable<JsonValue[]>): Promise<JsonValue[]>
   for await (const chunk of chunks) rows.push(...chunk);
   return rows;
 }
+/** The text surface decodes to exactly the structured response. */
 function surfaces(response: object): void {
-  const content = formatResult(response);
-  const text = content[0]?.text ?? '';
+  const text = formatResult(response)[0]?.text ?? '';
   const fence = text.slice(0, text.indexOf('json\n'));
   expect(JSON.parse(text.slice(fence.length + 5, text.lastIndexOf(`\n${fence}`)))).toEqual(
     response,
   );
-  expect(
-    Buffer.byteLength(JSON.stringify({ content, structuredContent: response }), 'utf8') + 512,
-  ).toBeLessThanOrEqual(24_000);
 }
 afterEach(() => {
   vi.restoreAllMocks();
@@ -138,7 +138,7 @@ describe('revisioned acquisition', () => {
   it('distinguishes unavailable state from unreadable values and provider failures', async () => {
     const ctx = createMockContext();
     await expect(readJson(ctx, 'missing')).rejects.toMatchObject({
-      message: 'The continuation or record is unavailable; restart the original scoped request.',
+      message: 'The continuation is unavailable; restart the original scoped request.',
       data: { reason: 'cursor_invalid' },
     });
     const get = vi.spyOn(ctx.state, 'get');
@@ -177,9 +177,9 @@ describe('revisioned acquisition', () => {
       1,
     ]);
   });
-  it('honors requested result page size independently from byte capacity', async () => {
+  it('honors the requested result page size', async () => {
     const ctx = createMockContext();
-    const options = { ...base, identify, maxRecords: 2, records: [1, 2, 3, 4, 5] };
+    const options = { ...base, pageSize: 2, records: [1, 2, 3, 4, 5] };
     const first = await serveResults(ctx, options);
     expect(windowOf(first.response).records).toEqual([1, 2]);
     const second = await serveResults(ctx, { ...options, cursor: first.checkpoint.cursor });
@@ -198,7 +198,6 @@ describe('revisioned acquisition', () => {
     const first = await serveResults(ctx, {
       ...base,
       provenance,
-      identify,
       records: Array.from({ length: 126 }, (_, id) => ({ id })),
     });
     const recovered = await resolveCheckpoint(ctx, {
@@ -208,7 +207,6 @@ describe('revisioned acquisition', () => {
     expect(recovered).toMatchObject({ provenance });
     const continued = await serveResults(ctx, {
       ...base,
-      identify,
       cursor: first.checkpoint.cursor,
       provenance: { source: 'fara', retrieved_at: '2026-10-25T00:00:00Z' },
       buildResponse: (window, metadata, storedProvenance) => ({
@@ -497,5 +495,269 @@ describe('revisioned acquisition', () => {
         ).response,
       ).records,
     ).toEqual([2]);
+  });
+});
+
+/** A stub source serving `total` numbered rows in upstream pages of `perPage`. */
+function numbered(total: number, perPage = 25) {
+  const pages = Array.from({ length: Math.ceil(total / perPage) }, (_, page) =>
+    Array.from({ length: Math.min(perPage, total - page * perPage) }, (_, row) => ({
+      id: page * perPage + row,
+    })),
+  );
+  return source(pages.length ? pages : [[]]);
+}
+const ids = (rows: JsonValue[]) => rows.map((row) => (row as { id: number }).id);
+const range = (start: number, end: number) =>
+  Array.from({ length: end - start }, (_, index) => start + index);
+
+describe('count-bounded delivery', () => {
+  it('delivers 30 matches at page size 10 as 10, 10, 10, topping up from upstream page 2 on the third call', async () => {
+    const ctx = createMockContext();
+    const upstream = numbered(30);
+    const options = { ...base, pageSize: 10, source: upstream };
+    const windows: DeliveryWindow[] = [];
+    const fetches: number[] = [];
+    let cursor: string | undefined;
+    for (let call = 0; call < 3; call++) {
+      const result = await acquire(ctx, { ...options, ...(cursor ? { cursor } : {}) });
+      windows.push(windowOf(result.response));
+      fetches.push(upstream.fetchPage.mock.calls.length);
+      cursor = result.checkpoint.cursor;
+    }
+    expect(windows.map(({ records }) => records.length)).toEqual([10, 10, 10]);
+    expect(fetches).toEqual([1, 1, 2]);
+    expect(windows.flatMap(({ records }) => ids(records))).toEqual(range(0, 30));
+    expect(windows.map(({ offset }) => offset)).toEqual([0, 10, 20]);
+    expect(windows.map(({ output_complete }) => output_complete)).toEqual([false, false, true]);
+    expect(windows[2]).not.toHaveProperty('next_cursor');
+  });
+  it('stops topping up once page size matches are pending', async () => {
+    const ctx = createMockContext();
+    const upstream = numbered(25, 5);
+    const result = await acquire(ctx, {
+      ...base,
+      pageSize: 4,
+      maxPages: 5,
+      source: upstream,
+      matches: (row) => (row as { id: number }).id % 5 < 2,
+    });
+    expect(upstream.fetchPage).toHaveBeenCalledTimes(2);
+    expect(ids(windowOf(result.response).records)).toEqual([0, 1, 5, 6]);
+    expect(windowOf(result.response).next_cursor).toBe(result.checkpoint.cursor);
+  });
+  it('bounds the top-up by max pages and returns the short page with a cursor while collecting', async () => {
+    const ctx = createMockContext();
+    const upstream = numbered(12, 3);
+    const options = { ...base, pageSize: 10, maxPages: 2, source: upstream };
+    const first = await acquire(ctx, options);
+    expect(upstream.fetchPage).toHaveBeenCalledTimes(2);
+    expect(windowOf(first.response)).toMatchObject({
+      records_returned: 6,
+      output_complete: false,
+      next_cursor: first.checkpoint.cursor,
+    });
+    const second = await acquire(ctx, { ...options, cursor: first.checkpoint.cursor });
+    expect(upstream.fetchPage).toHaveBeenCalledTimes(4);
+    expect(ids(windowOf(second.response).records)).toEqual(range(6, 12));
+    expect(windowOf(second.response).output_complete).toBe(true);
+  });
+  it('ends an exact multiple of page size without an empty trailing window', async () => {
+    const ctx = createMockContext();
+    const upstream = numbered(20);
+    const first = await acquire(ctx, { ...base, pageSize: 10, source: upstream });
+    const second = await acquire(ctx, {
+      ...base,
+      pageSize: 10,
+      source: upstream,
+      cursor: first.checkpoint.cursor,
+    });
+    expect([first, second].map((result) => windowOf(result.response).records.length)).toEqual([
+      10, 10,
+    ]);
+    expect(windowOf(second.response).output_complete).toBe(true);
+    expect(windowOf(second.response)).not.toHaveProperty('next_cursor');
+    const served = { ...base, pageSize: 20, records: range(0, 40) };
+    const head = await serveResults(ctx, served);
+    const tail = await serveResults(ctx, { ...served, cursor: head.checkpoint.cursor });
+    expect(windowOf(head.response).output_complete).toBe(false);
+    expect(windowOf(tail.response)).toMatchObject({
+      records: range(20, 40),
+      output_complete: true,
+    });
+    expect(windowOf(tail.response)).not.toHaveProperty('next_cursor');
+  });
+  it('fails a continuation whose top-up fetch fails, keeping its pending rows for a retry of the same cursor', async () => {
+    const ctx = createMockContext();
+    const upstream = numbered(30, 12);
+    const options = { ...base, pageSize: 10, source: upstream };
+    const first = await acquire(ctx, options);
+    expect(ids(windowOf(first.response).records)).toEqual(range(0, 10));
+    // Two matches remain pending, fewer than page_size, so the continuation fetches upstream page 2.
+    upstream.fetchPage.mockRejectedValueOnce(new Error('Synthetic upstream outage'));
+    await expect(acquire(ctx, { ...options, cursor: first.checkpoint.cursor })).rejects.toThrow(
+      'Synthetic upstream outage',
+    );
+    expect(
+      (await resolveCheckpoint(ctx, { tool: base.tool, cursor: first.checkpoint.cursor })).revision,
+    ).toBe(1);
+    const retried = await acquire(ctx, { ...options, cursor: first.checkpoint.cursor });
+    expect(ids(windowOf(retried.response).records)).toEqual(range(10, 20));
+    expect(windowOf(retried.response).offset).toBe(10);
+    expect(upstream.fetchPage).toHaveBeenCalledTimes(3);
+  });
+  it('reads retained windows across 125-row storage chunks and replays a crossing window', async () => {
+    const ctx = createMockContext();
+    const rows = range(0, 300).map((id) => ({ id }));
+    const options = {
+      ...base,
+      pageSize: 20,
+      source: source([[1]]),
+      retainAll: true,
+      finalize: async () => ({ records: rows }),
+    };
+    // One upstream page completes the scan, so the first call already delivers final rows.
+    let result = await acquire(ctx, options);
+    const windows: DeliveryWindow[] = [windowOf(result.response)];
+    let replayed = 0;
+    while (!windows.at(-1)?.output_complete) {
+      const cursor = result.checkpoint.cursor;
+      result = await acquire(ctx, { ...options, cursor });
+      windows.push(windowOf(result.response));
+      if (windowOf(result.response).offset !== 120) continue;
+      const replay = await acquire(ctx, { ...options, cursor });
+      expect(replay.response).toEqual(result.response);
+      replayed++;
+    }
+    expect(replayed).toBe(1);
+    expect(windows.map(({ records }) => records.length)).toEqual(Array(15).fill(20));
+    expect(windows.map(({ offset }) => offset)).toEqual(range(0, 15).map((n) => n * 20));
+    expect(windows.every(({ total_records }) => total_records === 300)).toBe(true);
+    expect(windows.flatMap(({ records }) => records)).toEqual(rows);
+    expect(ids(windows[6]?.records ?? [])).toEqual(range(120, 140));
+  });
+  it('serves fixed result windows across chunk boundaries', async () => {
+    const ctx = createMockContext();
+    const fixed = { ...base, pageSize: 125, records: range(0, 300) };
+    const lengths: number[] = [];
+    let result = await serveResults(ctx, fixed);
+    lengths.push(windowOf(result.response).records.length);
+    while (!windowOf(result.response).output_complete) {
+      result = await serveResults(ctx, { ...fixed, cursor: result.checkpoint.cursor });
+      lengths.push(windowOf(result.response).records.length);
+    }
+    expect(lengths).toEqual([125, 125, 50]);
+    const small = { ...base, pageSize: 20, records: range(0, 300) };
+    result = await serveResults(ctx, small);
+    while (windowOf(result.response).offset < 120)
+      result = await serveResults(ctx, { ...small, cursor: result.checkpoint.cursor });
+    expect(windowOf(result.response)).toMatchObject({ offset: 120, records: range(120, 140) });
+  });
+  it('delivers records far over 24,000 bytes whole on both response surfaces', async () => {
+    const ctx = createMockContext();
+    const big = (id: number) => ({
+      id,
+      text: `${'漢字🌲'.repeat(4000)}${'x'.repeat(30_000)}`,
+      document: 'https://lda.gov/a.pdf',
+    });
+    const sourced = await acquire(ctx, {
+      ...base,
+      pageSize: 3,
+      source: source([[big(1), big(2), big(3), big(4)]]),
+    });
+    expect(windowOf(sourced.response).records).toEqual([big(1), big(2), big(3)]);
+    expect(sourced.response).not.toHaveProperty('record_handles');
+    surfaces(sourced.response);
+    expect(Buffer.byteLength(JSON.stringify(sourced.response), 'utf8')).toBeGreaterThan(3 * 24_000);
+    const retained = await acquire(ctx, {
+      ...base,
+      tool: 'uslobbying_get_issue_spending',
+      pageSize: 2,
+      source: source([[1]]),
+      retainAll: true,
+      finalize: async () => ({ records: [big(5), big(6)] }),
+    });
+    expect(windowOf(retained.response).records).toEqual([big(5), big(6)]);
+    surfaces(retained.response);
+  });
+  it('rejects a page size that is not a positive integer', async () => {
+    const ctx = createMockContext();
+    for (const pageSize of [0, -1, 2.5])
+      await expect(
+        acquire(ctx, { ...base, pageSize, source: source([[1]]) }),
+      ).rejects.toMatchObject({ name: 'ZodError' });
+  });
+});
+
+describe('delivery window fields (characterization)', () => {
+  it('reports result-window offsets, totals and continuation fields', async () => {
+    const ctx = createMockContext();
+    const options = { ...base, pageSize: 2, records: [1, 2, 3, 4, 5] };
+    const first = await serveResults(ctx, options);
+    const second = await serveResults(ctx, { ...options, cursor: first.checkpoint.cursor });
+    const replay = await serveResults(ctx, { ...options, cursor: first.checkpoint.cursor });
+    const third = await serveResults(ctx, { ...options, cursor: second.checkpoint.cursor });
+    expect(replay.response).toEqual(second.response);
+    const windows = [first, second, third].map((result) => windowOf(result.response));
+    expect(windows.map(({ records }) => records)).toEqual([[1, 2], [3, 4], [5]]);
+    expect(windows.map(({ offset }) => offset)).toEqual([0, 2, 4]);
+    expect(windows.map(({ total_records }) => total_records)).toEqual([5, 5, 5]);
+    expect(windows.map(({ records_returned }) => records_returned)).toEqual([2, 2, 1]);
+    expect(windows.map(({ output_complete }) => output_complete)).toEqual([false, false, true]);
+    expect(windows.map(({ truncated }) => truncated)).toEqual([true, true, false]);
+    expect(windows[0]?.next_cursor).toBe(first.checkpoint.cursor);
+    expect(windows[0]?.coverage.next_cursor).toBe(first.checkpoint.cursor);
+    expect(windows[2]).not.toHaveProperty('next_cursor');
+    expect(windows[2]?.coverage).not.toHaveProperty('next_cursor');
+  });
+  it('reports pending-path offsets without a total', async () => {
+    const ctx = createMockContext();
+    const upstream = source([[1], [2]]);
+    const first = await acquire(ctx, { ...base, source: upstream });
+    const second = await acquire(ctx, {
+      ...base,
+      source: upstream,
+      cursor: first.checkpoint.cursor,
+    });
+    expect(windowOf(first.response)).toMatchObject({
+      records: [1],
+      offset: 0,
+      records_returned: 1,
+      output_complete: false,
+      next_cursor: first.checkpoint.cursor,
+    });
+    expect(windowOf(second.response)).toMatchObject({
+      records: [2],
+      offset: 1,
+      records_returned: 1,
+      output_complete: true,
+    });
+    for (const result of [first, second])
+      expect(windowOf(result.response)).not.toHaveProperty('total_records');
+    expect(windowOf(second.response)).not.toHaveProperty('next_cursor');
+  });
+  it('returns an empty complete window for an empty scope', async () => {
+    const ctx = createMockContext();
+    const sourced = windowOf((await acquire(ctx, { ...base, source: source([[]]) })).response);
+    expect(sourced).toMatchObject({ records: [], offset: 0, output_complete: true });
+    expect(sourced).not.toHaveProperty('next_cursor');
+    const served = windowOf((await serveResults(ctx, { ...base, records: [] })).response);
+    expect(served).toMatchObject({
+      records: [],
+      offset: 0,
+      total_records: 0,
+      output_complete: true,
+    });
+  });
+  it('returns an empty complete window when continuing past the delivered end', async () => {
+    const ctx = createMockContext();
+    const options = { ...base, pageSize: 3, records: [1, 2, 3] };
+    const first = await serveResults(ctx, options);
+    expect(windowOf(first.response).output_complete).toBe(true);
+    const past = windowOf(
+      (await serveResults(ctx, { ...options, cursor: first.checkpoint.cursor })).response,
+    );
+    expect(past).toMatchObject({ records: [], offset: 3, total_records: 3, output_complete: true });
+    expect(past).not.toHaveProperty('next_cursor');
   });
 });

@@ -6,7 +6,7 @@ export type FaraStatus = 'active' | 'terminated' | 'all';
 /** Complete snapshot search scope. */
 export interface FaraSearch {
   country?: string;
-  entity?: 'registrants' | 'foreign_principals';
+  entity?: 'registrants' | 'foreign_principals' | 'short_forms';
   name_contains?: string;
   status?: FaraStatus;
 }

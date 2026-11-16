@@ -36,6 +36,13 @@
           "default": "false"
         },
         {
+          "name": "USLOBBYING_CLAMP_LIMITS",
+          "description": "Clamp over-cap page_size, max_pages and row_limit values to their ceiling; false rejects them.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "CANVAS_PROVIDER_TYPE",
           "description": "Optional SQL canvas provider: none or duckdb.",
           "format": "string",
@@ -74,6 +81,13 @@
           "format": "string",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "USLOBBYING_CLAMP_LIMITS",
+          "description": "Clamp over-cap page_size, max_pages and row_limit values to their ceiling; false rejects them.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",

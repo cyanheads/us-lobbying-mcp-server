@@ -44,7 +44,6 @@ it('delivers dataset metadata once, replays it exactly and stages omitted sets c
     expect(
       JSON.parse(text.slice(fence.length + 5, text.indexOf(`\n${fence}`, fence.length + 5))),
     ).toEqual(data);
-    expect(Buffer.byteLength(JSON.stringify(result)) + 512).toBeLessThanOrEqual(24_000);
     return data;
   };
   try {
@@ -53,6 +52,7 @@ it('delivers dataset metadata once, replays it exactly and stages omitted sets c
       client_ids: ['1', '2'],
       years: [2024],
       max_pages: 1,
+      page_size: 10,
       row_sets: ['activities'],
     });
     expect(first.status).toBe('collecting');
@@ -78,8 +78,7 @@ it('delivers dataset metadata once, replays it exactly and stages omitted sets c
       { ...f.ctx, state },
     );
     expect(query.rows).toEqual([{ n: '25' }]);
-    let delivered =
-      z.number().parse(output.records_returned) + z.number().parse(output.records_deferred);
+    let delivered = z.number().parse(output.records_returned);
     let windows = 1;
     while (!output.output_complete && windows < 100) {
       output = await invoke({ cursor: output.next_cursor });
@@ -96,14 +95,84 @@ it('delivers dataset metadata once, replays it exactly and stages omitted sets c
         selected_filings: 25,
         activities: 25,
       });
-      delivered +=
-        z.number().parse(output.records_returned) + z.number().parse(output.records_deferred);
+      delivered += z.number().parse(output.records_returned);
       windows++;
     }
     expect(output.output_complete).toBe(true);
     expect(delivered).toBe(25);
-    expect(windows).toBeGreaterThan(1);
+    expect(windows).toBe(3);
     expect(requests).toBe(2);
+  } finally {
+    getLdaService().dispose();
+    await f.close();
+    vi.useRealTimers();
+  }
+});
+
+it('stages identical tables and totals whether or not include strips delivered activity fields', async () => {
+  const f = await fixture();
+  vi.useFakeTimers();
+  const description = 'Spectrum auction oversight é🌲';
+  const rows = Array.from({ length: 3 }, (_, n) =>
+    filing(n + 1, {
+      lobbying_activities: [
+        {
+          general_issue_code: 'TEC',
+          description,
+          lobbyists: [{ lobbyist: { id: '7' }, covered_position: 'Former aide', new: false }],
+        },
+      ],
+    }),
+  );
+  initLdaService({
+    fetch: async () => Response.json({ count: rows.length, next: null, results: rows }),
+  });
+  const state = createMockContext().state;
+  const handler: typeof getClientProfile.handler = (args, ctx) =>
+    getClientProfile.handler(args, { ...ctx, state });
+  async function run(include: Parameters<typeof handler>[0]['include']) {
+    const pending = runToolContract(
+      { ...getClientProfile, handler },
+      { mode: 'profile', client_ids: ['1'], years: [2024], ...(include ? { include } : {}) },
+    );
+    await vi.advanceTimersByTimeAsync(4100);
+    const result = await pending;
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const output = z.record(z.string(), z.unknown()).parse(result.structuredContent);
+    expect(output.output_complete).toBe(true);
+    const dataset = z
+      .object({
+        canvas_id: z.string(),
+        tables: z.array(
+          z.object({ table_name: z.string(), row_count: z.number(), grain: z.string() }),
+        ),
+      })
+      .parse(output.dataset);
+    const tables = [];
+    for (const table of dataset.tables) {
+      const query = await queryCanvas(
+        { canvas_id: dataset.canvas_id, sql: `SELECT * FROM ${table.table_name}` },
+        { ...f.ctx, state },
+      );
+      tables.push({
+        grain: table.grain,
+        row_count: table.row_count,
+        rows: query.rows.map((row) => JSON.stringify(row)).sort(),
+      });
+    }
+    return { output, tables };
+  }
+  try {
+    const narrow = await run(undefined);
+    const wide = await run(['activity_descriptions', 'activity_lobbyists']);
+    expect(narrow.tables).toEqual(wide.tables);
+    expect(narrow.tables.flatMap((table) => table.rows).join('\n')).toContain(description);
+    expect(narrow.output.row_set_totals).toEqual(wide.output.row_set_totals);
+    const delivered = (output: Record<string, unknown>) => JSON.stringify(output.raw_filings);
+    expect(delivered(narrow.output)).not.toContain(description);
+    expect(delivered(narrow.output)).not.toContain('Former aide');
+    expect(delivered(wide.output)).toContain(description);
+    expect(delivered(wide.output)).toContain('Former aide');
   } finally {
     getLdaService().dispose();
     await f.close();

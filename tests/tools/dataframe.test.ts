@@ -2,9 +2,8 @@
 
 import type { z } from '@cyanheads/mcp-ts-core';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FULL_RESULT_TARGET_BYTES, QueryWindowSchema } from '../../src/domain/contracts.js';
-import { fullResultBytes } from '../../src/domain/format.js';
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
+import { QueryWindowSchema } from '../../src/domain/contracts.js';
 import { dataframeDescribeTool } from '../../src/mcp-server/tools/definitions/dataframe-describe.tool.js';
 import { dataframeQueryTool } from '../../src/mcp-server/tools/definitions/dataframe-query.tool.js';
 import {
@@ -12,7 +11,7 @@ import {
   queryCanvas,
   setCanvas,
 } from '../../src/services/canvas/canvas-service.js';
-import { fixture, stage } from '../services/canvas/fixture.js';
+import { filing, fixture, stage } from '../services/canvas/fixture.js';
 
 describe('dataframe contracts', () => {
   let f: Awaited<ReturnType<typeof fixture>>;
@@ -36,6 +35,19 @@ describe('dataframe contracts', () => {
       input,
     );
   }
+  /** Run one query call, returning its result and every clamp the call logged. */
+  async function logged(input: z.input<typeof dataframeQueryTool.input>) {
+    let info: MockInstance | undefined;
+    const handler: typeof dataframeQueryTool.handler = (args, ctx) => {
+      info = vi.spyOn(ctx.log, 'info');
+      return dataframeQueryTool.handler(args, { ...ctx, state: f.ctx.state });
+    };
+    const result = await runToolContract({ ...dataframeQueryTool, handler }, input);
+    const clamps = (info?.mock.calls ?? []).filter(
+      ([message]) => message === 'Clamped a count control to its served ceiling.',
+    );
+    return { result, clamps: clamps.map((call) => call[1]) };
+  }
   function exact(result: Awaited<ReturnType<typeof query>>) {
     expect(result.isError).not.toBe(true);
     const text = result.content.find((c) => c.type === 'text');
@@ -51,33 +63,36 @@ describe('dataframe contracts', () => {
     const first = exact(
       await query({
         canvas_id: data.canvas_id,
-        sql: 'SELECT 2 AS n UNION ALL SELECT 1 UNION ALL SELECT 1',
+        sql: 'SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 1 ORDER BY n DESC',
         register_as: 'stable',
         row_limit: 1,
       }),
     );
-    expect(first.rows).toEqual([{ n: 1 }]);
+    expect(first.rows).toEqual([{ n: 2 }]);
     expect(first.row_count).toBe(3);
     expect(first.next_offset).toBe(1);
+    expect(first.row_order).toBe('sql_result');
     const second = exact(
       await query({ canvas_id: data.canvas_id, result_table: 'stable', offset: 1, row_limit: 1 }),
     );
     const third = exact(
       await query({ canvas_id: data.canvas_id, result_table: 'stable', offset: 2, row_limit: 100 }),
     );
-    expect([...first.rows, ...second.rows, ...third.rows]).toEqual([{ n: 1 }, { n: 1 }, { n: 2 }]);
+    expect([...first.rows, ...second.rows, ...third.rows]).toEqual([{ n: 2 }, { n: 1 }, { n: 1 }]);
     expect(third.output_complete).toBe(true);
     const end = exact(
       await query({ canvas_id: data.canvas_id, result_table: 'stable', offset: 3 }),
     );
     expect(end.rows).toEqual([]);
-    expect(end.output_complete).toBe(true);
+    expect(end).toMatchObject({ rows_returned: 0, output_complete: true, truncated: false });
+    expect(end.next_offset).toBeUndefined();
     expect(executed.mock.calls.filter((call) => call[3]?.registerAs === 'stable')).toHaveLength(1);
     const beyond = await query({ canvas_id: data.canvas_id, result_table: 'stable', offset: 4 });
     expect(beyond).toMatchObject({
       isError: true,
       structuredContent: { error: { data: { reason: 'invalid_filter' } } },
     });
+    expect(JSON.stringify(beyond.content)).toContain('offset at most its row_count');
   });
 
   it.each([
@@ -125,66 +140,45 @@ describe('dataframe contracts', () => {
     ).toEqual([{ n: 1 }]);
   });
 
-  it('advances byte windows by actual whole rows and preserves both surfaces', async () => {
-    const id = f.instance.canvasId;
-    const first = exact(
-      await query({
-        canvas_id: id,
-        sql: "SELECT i, repeat('é', 2000) AS text FROM (VALUES (0), (1), (2), (3), (4)) t(i)",
-        register_as: 'wide',
-        row_limit: 100,
-      }),
-    );
-    expect(first.rows_returned).toBeGreaterThan(0);
-    expect(first.rows_returned).toBeLessThan(5);
-    let page = first;
-    const rows = [...first.rows];
-    while (!page.output_complete) {
-      expect(fullResultBytes(page)).toBeLessThanOrEqual(FULL_RESULT_TARGET_BYTES);
-      expect(page.next_offset).toBe(page.offset + page.rows_returned);
-      page = exact(
-        await query({
-          canvas_id: id,
-          result_table: 'wide',
-          offset: page.next_offset!,
-          row_limit: 100,
-        }),
-      );
-      rows.push(...page.rows);
-    }
-    expect(rows).toHaveLength(5);
-    expect(rows.map((row) => row.i)).toEqual([0, 1, 2, 3, 4]);
-    expect(rows.every((row) => row.text === 'é'.repeat(2000))).toBe(true);
-  });
-
-  it('retains oversized results for narrower SQL recovery', async () => {
-    const result = await query({
-      canvas_id: f.instance.canvasId,
-      sql: "SELECT repeat('x', 30000) AS text",
-      register_as: 'oversize',
-    });
-    expect(result).toMatchObject({
-      isError: true,
-      structuredContent: {
-        error: {
-          data: {
-            reason: 'query_row_too_large',
-            canvas_id: f.instance.canvasId,
-            result_table: 'oversize',
-            describe_tool: 'uslobbying_dataframe_describe',
-            query_tool: 'uslobbying_dataframe_query',
-          },
-        },
-      },
-    });
-    expect(JSON.stringify(result.content)).toContain('SUBSTR');
-    const narrow = exact(
+  it('delivers rows far wider than 24,000 bytes whole at the requested count on both surfaces', async () => {
+    const page = exact(
       await query({
         canvas_id: f.instance.canvasId,
-        sql: 'SELECT SUBSTR(text, 1, 5) AS fragment FROM oversize',
+        sql: "SELECT i, repeat('é', 15000) AS text FROM (VALUES (0), (1), (2), (3), (4)) t(i) ORDER BY i",
+        register_as: 'wide',
+        row_limit: 4,
       }),
     );
-    expect(narrow.rows).toEqual([{ fragment: 'xxxxx' }]);
+    expect(page).toMatchObject({ rows_returned: 4, row_count: 5, next_offset: 4 });
+    expect(page.rows.map((row) => row.i)).toEqual([0, 1, 2, 3]);
+    expect(page.rows.every((row) => row.text === 'é'.repeat(15000))).toBe(true);
+    const single = exact(
+      await query({ canvas_id: f.instance.canvasId, sql: "SELECT repeat('x', 30000) AS text" }),
+    );
+    expect(Buffer.byteLength(JSON.stringify(single.rows[0]), 'utf8')).toBeGreaterThan(24_000);
+    expect(single).toMatchObject({ rows: [{ text: 'x'.repeat(30000) }], output_complete: true });
+  });
+
+  it('returns SELECT * over staged raw filings as whole rows', async () => {
+    const description = 'd'.repeat(30000);
+    const data = await stage(f, [
+      filing(1),
+      filing(2, { lobbying_activities: [{ general_issue_code: 'TEC', description }] }),
+      filing(3),
+    ]);
+    const page = exact(
+      await query({
+        canvas_id: data.canvas_id,
+        sql: `SELECT * FROM ${data.tables[0]!.table_name} ORDER BY filing_uuid`,
+      }),
+    );
+    expect(page).toMatchObject({ rows_returned: 3, row_count: 3, output_complete: true });
+    expect(page.rows.map((row) => row.filing_uuid)).toEqual(
+      [1, 2, 3].map((n) => filing(n).filing_uuid),
+    );
+    expect(JSON.parse(String(page.rows[1]!.lobbying_activities))).toEqual([
+      expect.objectContaining({ general_issue_code: 'TEC', description }),
+    ]);
   });
 
   it('returns exactly the requested 100-row boundary while staging the complete result', async () => {
@@ -204,27 +198,107 @@ describe('dataframe contracts', () => {
     expect(last.rows).toEqual([{ n: 100 }]);
   });
 
-  it('rejects oversized schema metadata and retains a recoverable materialization', async () => {
+  it('delivers results and describes tables whose metadata passes 24,000 bytes', async () => {
     const column = `column_${'x'.repeat(13000)}`;
-    const result = await query({
+    const page = exact(
+      await query({
+        canvas_id: f.instance.canvasId,
+        sql: `SELECT 1 AS "${column}"`,
+        register_as: 'huge_metadata',
+      }),
+    );
+    expect(page.rows).toEqual([{ [column]: 1 }]);
+    expect(page.columns).toEqual([{ name: column, type: 'INTEGER', nullable: true }]);
+    const describe: typeof dataframeDescribeTool.handler = (args, ctx) =>
+      dataframeDescribeTool.handler(args, { ...ctx, state: f.ctx.state });
+    const described = await runToolContract(
+      { ...dataframeDescribeTool, handler: describe },
+      { canvas_id: f.instance.canvasId },
+    );
+    expect(described.isError).not.toBe(true);
+    expect(described.structuredContent).toMatchObject({
+      tables: [
+        {
+          table_name: 'huge_metadata',
+          columns: [{ name: column }],
+          sql: `SELECT 1 AS "${column}"`,
+        },
+      ],
+    });
+    expect(JSON.stringify(described.content)).toContain(column);
+  });
+
+  it('returns 25 rows by default and exactly the rest at the end', async () => {
+    const { result, clamps } = await logged({
       canvas_id: f.instance.canvasId,
-      sql: `SELECT 1 AS "${column}"`,
-      register_as: 'huge_metadata',
+      sql: 'SELECT CAST(i AS INTEGER) AS i FROM range(130) t(i) ORDER BY i',
+      register_as: 'counted',
     });
-    expect(result).toMatchObject({
-      isError: true,
-      structuredContent: {
-        error: { data: { reason: 'query_row_too_large', result_table: 'huge_metadata' } },
-      },
-    });
-    expect(
-      exact(
-        await query({
-          canvas_id: f.instance.canvasId,
-          sql: `SELECT "${column}" AS small FROM huge_metadata`,
-        }),
-      ).rows,
-    ).toEqual([{ small: 1 }]);
+    const first = exact(result);
+    expect(first.rows).toEqual(Array.from({ length: 25 }, (_, i) => ({ i })));
+    expect(first).toMatchObject({ row_count: 130, next_offset: 25, delivery_limits: {} });
+    expect(result.structuredContent).not.toHaveProperty('effective_row_limit');
+    expect(clamps).toEqual([]);
+    const full = exact(
+      await query({ canvas_id: f.instance.canvasId, result_table: 'counted', row_limit: 100 }),
+    );
+    expect(full).toMatchObject({ rows_returned: 100, next_offset: 100, truncated: true });
+    const rest = exact(
+      await query({
+        canvas_id: f.instance.canvasId,
+        result_table: 'counted',
+        offset: 100,
+        row_limit: 100,
+      }),
+    );
+    expect(rest.rows).toEqual(Array.from({ length: 30 }, (_, i) => ({ i: i + 100 })));
+    expect(rest).toMatchObject({ output_complete: true, truncated: false });
+    expect(rest.next_offset).toBeUndefined();
+  });
+
+  it('reads a float-noise row_limit as its integer, as the other count controls do', async () => {
+    const page = exact(
+      await query({
+        canvas_id: f.instance.canvasId,
+        sql: 'SELECT CAST(i AS INTEGER) AS i FROM range(30) t(i) ORDER BY i',
+        row_limit: 20.000000000000004,
+      }),
+    );
+    expect(page.rows).toEqual(Array.from({ length: 20 }, (_, i) => ({ i })));
+    expect(page).toMatchObject({ rows_returned: 20, next_offset: 20, delivery_limits: {} });
+  });
+
+  it('rejects row_limit 101 with invalid_filter when USLOBBYING_CLAMP_LIMITS=false', async () => {
+    vi.stubEnv('USLOBBYING_CLAMP_LIMITS', 'false');
+    vi.resetModules();
+    const service = await import('../../src/services/canvas/canvas-service.js');
+    const { dataframeQueryTool: strict } = await import(
+      '../../src/mcp-server/tools/definitions/dataframe-query.tool.js'
+    );
+    service.setCanvas(f.canvas, 100);
+    try {
+      const handler: typeof strict.handler = (args, ctx) =>
+        strict.handler(args, { ...ctx, state: f.ctx.state });
+      const run = (row_limit: number) =>
+        runToolContract(
+          { ...strict, handler },
+          { canvas_id: f.instance.canvasId, sql: 'SELECT 1 AS n', row_limit },
+        );
+      const rejected = await run(101);
+      expect(rejected).toMatchObject({
+        isError: true,
+        structuredContent: {
+          error: { data: { reason: 'invalid_filter', field: 'row_limit', maximum: 100 } },
+        },
+      });
+      expect(JSON.stringify(rejected.content)).toContain('row_limit cannot exceed 100.');
+      expect(await f.instance.describe()).toEqual([]);
+      const accepted = await run(100);
+      expect(accepted.isError).not.toBe(true);
+      expect(accepted.structuredContent).toMatchObject({ rows: [{ n: 1 }], delivery_limits: {} });
+    } finally {
+      service.setCanvas(undefined);
+    }
   });
 
   it('routes expired canvas recovery on both response surfaces', async () => {
@@ -267,7 +341,7 @@ describe('dataframe contracts', () => {
   });
 
   it('clamps requested SQL rows with provider disclosure on both surfaces', async () => {
-    const result = await query({
+    const { result, clamps } = await logged({
       canvas_id: f.instance.canvasId,
       sql: `SELECT * FROM (VALUES ${Array.from({ length: 102 }, (_, n) => `(${n})`).join(',')}) t(i)`,
       row_limit: 101,
@@ -275,17 +349,30 @@ describe('dataframe contracts', () => {
     const page = exact(result);
     expect(page.rows).toHaveLength(100);
     expect(page.delivery_limits).toEqual({ row_limit: { requested: 101, effective: 100 } });
+    const clamp = { tool: 'uslobbying_dataframe_query', control: 'row_limit' };
+    expect(clamps).toEqual([{ ...clamp, requested: 101, effective: 100 }]);
     setCanvas(f.canvas, 2);
-    const limitedResult = await query({
+    const limitedCall = await logged({
       canvas_id: f.instance.canvasId,
       result_table: page.result_table,
       offset: 100,
       row_limit: 200,
     });
+    const limitedResult = limitedCall.result;
     const limited = exact(limitedResult);
     expect(limited.rows).toEqual([{ i: 100 }, { i: 101 }]);
     expect(limited.delivery_limits).toEqual({ row_limit: { requested: 200, effective: 2 } });
     expect(limitedResult.structuredContent).toMatchObject({ effective_row_limit: 2 });
+    expect(limitedCall.clamps).toEqual([{ ...clamp, requested: 200, effective: 2 }]);
+    const below = exact(
+      await query({
+        canvas_id: f.instance.canvasId,
+        result_table: page.result_table,
+        row_limit: 50,
+      }),
+    );
+    expect(below.rows).toEqual([{ i: 0 }, { i: 1 }]);
+    expect(below.delivery_limits).toEqual({ row_limit: { requested: 50, effective: 2 } });
     const empty = exact(
       await query({
         canvas_id: f.instance.canvasId,

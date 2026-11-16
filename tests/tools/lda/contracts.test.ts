@@ -1,6 +1,6 @@
 /** @fileoverview LDA tools through runtime argument/output/format contracts and real acquisition. @module tests/tools/lda/contracts */
 import { z } from '@cyanheads/mcp-ts-core';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getClientProfile } from '../../../src/mcp-server/tools/definitions/lda/get-client-profile.tool.js';
 import { getContributions } from '../../../src/mcp-server/tools/definitions/lda/get-contributions.tool.js';
@@ -9,8 +9,8 @@ import { searchFilings } from '../../../src/mcp-server/tools/definitions/lda/sea
 import { searchLobbyists } from '../../../src/mcp-server/tools/definitions/lda/search-lobbyists.tool.js';
 import { setCanvas } from '../../../src/services/canvas/canvas-service.js';
 import { getLdaService, initLdaService } from '../../../src/services/lda/lda-service.js';
+import { invoke, page, resetTenant, success, tenant, uuid } from './harness.js';
 
-const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 const filing = (n = 1, extra: object = {}) => ({
   filing_uuid: uuid(n),
   filing_type: 'Q1',
@@ -32,19 +32,12 @@ const filing = (n = 1, extra: object = {}) => ({
   future: { nested: [null, false, 'é🌲'] },
   ...extra,
 });
-const page = (results: unknown[], next: string | null = null) => ({
-  count: results.length,
-  results,
-  next,
-});
-type Definition = Parameters<typeof runToolContract>[0];
-let state: ReturnType<typeof createMockContext>['state'];
 let calls: URL[];
 let respond: (url: URL) => Response;
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-01-01'));
-  state = createMockContext().state;
+  resetTenant();
   calls = [];
   setCanvas(undefined);
   respond = () => Response.json(page([]));
@@ -58,6 +51,9 @@ beforeEach(() => {
             { value: 'TEC', name: 'Telecommunications' },
             { value: 'HCR', name: 'Health' },
             { value: 'feca', name: 'FECA' },
+            { value: 'WA', name: 'Washington' },
+            { value: 'US', name: 'United States of America' },
+            { value: 'CA', name: 'Canada' },
           ])
         : respond(url);
     },
@@ -68,37 +64,6 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-async function invoke(definition: Definition, input: Record<string, unknown>) {
-  // The contract runner creates a request context per call; retain the real tenant store across requests.
-  const bound = {
-    ...definition,
-    handler: (args: never, ctx: Parameters<typeof definition.handler>[1]) =>
-      definition.handler(args, { ...ctx, state }),
-  };
-  const pending = runToolContract(bound, input);
-  await vi.runAllTimersAsync();
-  const result = await pending;
-  const data = z.record(z.string(), z.unknown()).parse(result.structuredContent);
-  const text = result.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n');
-  if (!result.isError) {
-    const fence = text.slice(0, text.indexOf('json\n'));
-    expect(
-      JSON.parse(text.slice(fence.length + 5, text.indexOf(`\n${fence}`, fence.length + 5))),
-    ).toEqual(data);
-    expect(definition.output?.parse(data)).toEqual(data);
-    expect(new TextEncoder().encode(JSON.stringify(result)).byteLength + 512).toBeLessThanOrEqual(
-      24_000,
-    );
-  }
-  return { result, data, text };
-}
-function success(value: Awaited<ReturnType<typeof invoke>>) {
-  expect(value.result.isError, value.text).not.toBe(true);
-  return value.data;
-}
 function reason(value: Awaited<ReturnType<typeof invoke>>, expected: string) {
   expect(value.result.isError).toBe(true);
   expect(value.data).toMatchObject({
@@ -140,7 +105,7 @@ describe('LDA runtime contracts', () => {
       );
       respond = () => Response.json(page(rows));
       let output = success(
-        await invoke(tool, { ...input, row_sets: ['raw_filings', 'activities'] }),
+        await invoke(tool, { ...input, page_size: 10, row_sets: ['raw_filings', 'activities'] }),
       );
       expect(output.effective_filters).toMatchObject({ row_sets: ['activities', 'raw_filings'] });
       const seen: unknown[] = [];
@@ -160,8 +125,7 @@ describe('LDA runtime contracts', () => {
           raw_filings: Math.min(Math.max(delivered - 25, 0), 25),
         });
         seen.push(...z.array(z.unknown()).parse(output.raw_filings ?? []));
-        delivered +=
-          z.number().parse(output.records_returned) + z.number().parse(output.records_deferred);
+        delivered += z.number().parse(output.records_returned);
         if (output.output_complete) break;
         const cursor = output.next_cursor;
         reason(await invoke(tool, { cursor, row_sets: ['selected_filings'] }), 'cursor_invalid');
@@ -214,19 +178,18 @@ describe('LDA runtime contracts', () => {
     expect(output).toMatchObject({
       total_records: 0,
       records_returned: 0,
-      records_deferred: 0,
       output_complete: true,
       row_set_totals: { selected_filings: 1, targeted_entities: 0, raw_filings: 1 },
     });
     const notices = z.array(z.string()).parse(output.notices);
     expect(notices).not.toContain(
-      'Source filings were acquired, but no quarterly filings survived version and issue selection.',
+      'Source filings were acquired, but no filings survived version and issue selection.',
     );
     expect(notices).toContain(
       'No rows belong to the selected inline row sets; inspect row_set_totals or request another selection.',
     );
   });
-  it('retains selected oversized parents and nested Unicode windows past the end', async () => {
+  it('delivers a selected oversized parent whole, nested Unicode text included', async () => {
     const text = 'é🌲```'.repeat(10_000);
     respond = () => Response.json(page([filing(1, { future: { nested: [{ text }] } })]));
     const output = success(
@@ -239,68 +202,11 @@ describe('LDA runtime contracts', () => {
     );
     expect(output).toMatchObject({
       total_records: 1,
-      records_returned: 0,
-      records_deferred: 1,
+      records_returned: 1,
       output_complete: true,
+      raw_filings: [{ filing_uuid: uuid(1), future: { nested: [{ text }] } }],
     });
     expect(output).not.toHaveProperty('selected_filings');
-    const handle = z
-      .array(z.object({ record_handle: z.string() }))
-      .parse(output.record_handles)[0]!.record_handle;
-    const parent = success(
-      await invoke(getClientProfile, {
-        record_handle: handle,
-        record_path: '/filing/future/nested',
-      }),
-    );
-    expect(parent.record_window).toMatchObject({
-      kind: 'array',
-      items: [{ index: 0, path: '/filing/future/nested/0' }],
-    });
-    const nested = success(
-      await invoke(getClientProfile, {
-        record_handle: handle,
-        record_path: '/filing/future/nested/0',
-      }),
-    );
-    expect(nested.record_window).toMatchObject({
-      kind: 'object',
-      entries: [{ key: 'text', path: '/filing/future/nested/0/text' }],
-    });
-    let offset = 0;
-    let recovered = '';
-    while (offset < [...text].length) {
-      const fragment = success(
-        await invoke(getClientProfile, {
-          record_handle: handle,
-          record_path: '/filing/future/nested/0/text',
-          record_offset: offset,
-        }),
-      );
-      const window = z
-        .object({ text: z.string(), returned: z.number(), next_offset: z.number().optional() })
-        .parse(fragment.record_window);
-      expect(window.returned).toBeGreaterThan(0);
-      recovered += window.text;
-      offset += window.returned;
-    }
-    expect(recovered).toBe(text);
-    const end = success(
-      await invoke(getClientProfile, {
-        record_handle: handle,
-        record_path: '/filing/future/nested/0/text',
-        record_offset: offset,
-      }),
-    );
-    expect(end.record_window).toMatchObject({ text: '', returned: 0, complete: true });
-    reason(
-      await invoke(getClientProfile, {
-        record_handle: handle,
-        record_path: '/filing/future/nested/0/text',
-        record_offset: offset + 1,
-      }),
-      'invalid_filter',
-    );
     expect(calls).toHaveLength(1);
   });
   it('rejects empty, duplicate, unknown and non-analytical row selections before transport', async () => {
@@ -315,13 +221,13 @@ describe('LDA runtime contracts', () => {
     );
     expect(calls).toEqual([]);
   });
-  it('characterizes decimal disclosure preservation and default record selector acceptance', async () => {
+  it('characterizes decimal disclosure preservation and the default include echo', async () => {
     const row = filing(1, { income: '9007199254740993.01', lobbying_activities: [] });
     respond = () => Response.json(page([row]));
-    const output = success(await invoke(searchFilings, { filing_year: 2024, record_limit: 25 }));
+    const output = success(await invoke(searchFilings, { filing_year: 2024 }));
     expect(output.filings).toEqual([row]);
     expect(calls[0]?.searchParams.get('page_size')).toBe('25');
-    expect(output.effective_filters).toEqual({ filing_year: 2024 });
+    expect(output.effective_filters).toEqual({ filing_year: 2024, include: [] });
   });
   it('maps complete native filing filters and preserves normalized scope', async () => {
     respond = () => Response.json(page([filing()]));
@@ -345,7 +251,9 @@ describe('LDA runtime contracts', () => {
       foreign_entity_country: 'CA',
       lobbyist_name: 'Person',
     });
-    const params = Object.fromEntries(calls[0]!.searchParams);
+    // Location codes are checked against LDA constants first; the filings request follows.
+    const filings = calls.find((url) => url.pathname === '/api/v1/filings/');
+    const params = Object.fromEntries(filings!.searchParams);
     expect(params).toMatchObject({
       filing_uuid: uuid(1),
       filing_dt_posted_after: '2024-01-01',
@@ -400,20 +308,18 @@ describe('LDA runtime contracts', () => {
         filing_year: 2024,
         page_size: 26,
         max_pages: 6,
-        record_limit: 26,
       }),
     );
-    expect(output.effective_filters).toEqual({ filing_year: 2024, page_size: 25 });
+    expect(output.effective_filters).toEqual({ filing_year: 2024, page_size: 25, include: [] });
     expect(output.delivery_limits).toEqual({
       page_size: { requested: 26, effective: 25 },
       max_pages: { requested: 6, effective: 5 },
-      record_limit: { requested: 26, effective: 25 },
     });
     expect(output.coverage).toMatchObject({ complete: true, records_fetched: 0 });
     const huge = success(await invoke(searchFilings, { filing_year: 2024, page_size: 1e20 }));
     expect(huge.delivery_limits).toEqual({ page_size: { requested: 1e20, effective: 25 } });
   });
-  it('compares effective page sizes, retains replay disclosure and retrieves clamped nested handles', async () => {
+  it('compares effective page sizes, retains replay disclosure and delivers a large record whole', async () => {
     const rows = Array.from({ length: 30 }, (_, n) => filing(n + 1));
     respond = () => Response.json(page(rows));
     const first = success(await invoke(searchFilings, { filing_year: 2024, page_size: 26 }));
@@ -426,75 +332,30 @@ describe('LDA runtime contracts', () => {
       await invoke(searchFilings, { cursor: first.next_cursor, page_size: 24 }),
       'cursor_invalid',
     );
-    respond = () =>
-      Response.json(page([filing(100, { future: { nested: [{ text: 'é🌲'.repeat(9000) }] } })]));
-    const large = success(await invoke(searchFilings, { filing_uuid: uuid(100) }));
-    const handle = z
-      .array(z.object({ record_handle: z.string() }))
-      .parse(large.record_handles)[0]!.record_handle;
-    const nested = success(
-      await invoke(searchFilings, {
-        record_handle: handle,
-        record_path: '/future/nested',
-        record_limit: 99,
-      }),
-    );
-    expect(nested.delivery_limits).toEqual({ record_limit: { requested: 99, effective: 25 } });
-    expect(nested.record_window).toMatchObject({
-      kind: 'array',
-      items: [{ path: '/future/nested/0' }],
+    const text = 'é🌲'.repeat(9000);
+    respond = () => Response.json(page([filing(100, { future: { nested: [{ text }] } })]));
+    const large = success(await invoke(searchFilings, { filing_uuid: uuid(100), page_size: 99 }));
+    expect(large.delivery_limits).toEqual({ page_size: { requested: 99, effective: 25 } });
+    expect(large).toMatchObject({
+      records_returned: 1,
+      output_complete: true,
+      filings: [{ filing_uuid: uuid(100), future: { nested: [{ text }] } }],
     });
-    const text = success(
-      await invoke(searchFilings, {
-        record_handle: handle,
-        record_path: '/future/nested/0/text',
-        record_limit: 99,
-      }),
-    );
-    expect(text.record_window).toMatchObject({
-      kind: 'string',
-      text: expect.stringContaining('é🌲'),
-      returned: expect.any(Number),
-    });
-    expect(z.object({ returned: z.number() }).parse(text.record_window).returned).toBeGreaterThan(
-      25,
-    );
-    const end = success(
-      await invoke(searchFilings, {
-        record_handle: handle,
-        record_path: '/future/nested',
-        record_offset: 1,
-        record_limit: 99,
-      }),
-    );
-    expect(end.record_window).toMatchObject({ items: [], complete: true });
-    reason(
-      await invoke(searchFilings, {
-        record_handle: handle,
-        record_path: '/future/nested',
-        record_offset: 2,
-        record_limit: 99,
-      }),
-      'invalid_filter',
-    );
   });
-  it('clears previous workload disclosures on fresh continuation and deferred reads', async () => {
+  it('clears previous workload disclosures on a fresh continuation', async () => {
     respond = () => Response.json(page(Array.from({ length: 30 }, (_, n) => filing(n + 1))));
     const first = success(
-      await invoke(searchFilings, { filing_year: 2024, max_pages: 6, record_limit: 26 }),
+      await invoke(searchFilings, { filing_year: 2024, max_pages: 6, page_size: 26 }),
     );
+    expect(first.delivery_limits).toEqual({
+      max_pages: { requested: 6, effective: 5 },
+      page_size: { requested: 26, effective: 25 },
+    });
     const second = success(await invoke(searchFilings, { cursor: first.next_cursor }));
     expect(second.delivery_limits).toEqual({});
     expect(
       success(await invoke(searchFilings, { cursor: first.next_cursor, max_pages: 99 })),
     ).toEqual(second);
-    respond = () => Response.json(page([filing(100, { future: 'é🌲'.repeat(9000) })]));
-    const large = success(await invoke(searchFilings, { filing_year: 2024, max_pages: 6 }));
-    const handle = z
-      .array(z.object({ record_handle: z.string() }))
-      .parse(large.record_handles)[0]!.record_handle;
-    const record = success(await invoke(searchFilings, { record_handle: handle }));
-    expect(record.delivery_limits).toEqual({});
   });
   it.each([
     { posted_after: '2024-02-30' },
@@ -550,6 +411,7 @@ describe('LDA runtime contracts', () => {
       filing_uuid: uuid(1),
       posted_after: '2024-01-01',
       amount_min: '-1.00',
+      include: ['activity_descriptions', 'activity_lobbyists'],
     });
     reason(
       await invoke(searchFilings, { filing_uuid: ' ', posted_after: ' ', amount_min: ' ' }),
@@ -610,7 +472,7 @@ describe('LDA runtime contracts', () => {
     });
     expect(output.notices).toEqual(
       expect.arrayContaining([
-        'Source filings were acquired, but no quarterly filings survived version and issue selection.',
+        'No filing acquired for 2024 survived version selection; its selections rows give each exclusion or ambiguity.',
         'No source filings were fetched for client_id=3, filing_year=2024; zero rows do not establish identifier validity.',
       ]),
     );
@@ -655,39 +517,13 @@ describe('LDA runtime contracts', () => {
     });
     expect(calls).toHaveLength(130);
   });
-  it('retains oversized partition notices behind lossless record handles', async () => {
+  it('delivers an oversized partition notice whole', async () => {
     const clientId = '7'.repeat(4000);
     const output = success(
       await invoke(getClientProfile, { mode: 'profile', client_ids: [clientId], years: [2024] }),
     );
-    expect(output.records_deferred).toBe(1);
-    expect(output.total_records).toBe(1);
-    const handle = z
-      .array(z.object({ record_handle: z.string() }))
-      .parse(output.record_handles)[0]!;
-    let restored = '';
-    let offset = 0;
-    for (let index = 0; index < 20; index++) {
-      const result = success(
-        await invoke(getClientProfile, {
-          record_handle: handle.record_handle,
-          record_path: '/notice',
-          record_offset: offset,
-        }),
-      );
-      const window = z
-        .object({
-          kind: z.literal('string'),
-          text: z.string(),
-          complete: z.boolean(),
-          next_offset: z.number().optional(),
-        })
-        .parse(result.record_window);
-      restored += window.text;
-      if (window.complete) break;
-      offset = window.next_offset!;
-    }
-    expect(restored).toBe(
+    expect(output).toMatchObject({ total_records: 1, records_returned: 1, output_complete: true });
+    expect(output.notices).toContain(
       `No source filings were fetched for client_id=${clientId}, filing_year=2024; zero rows do not establish identifier validity.`,
     );
     expect(calls).toHaveLength(1);
@@ -715,11 +551,13 @@ describe('LDA runtime contracts', () => {
       await invoke(getIssueSpending, { issue_code: 'UNKNOWN', years: [2024] }),
       'invalid_filter',
     );
-    expect(calls.filter((url) => url.pathname.includes('/constants/'))).toHaveLength(1);
+    // The first call cached the issue_codes constants on the service for 24 hours.
+    expect(calls).toHaveLength(0);
   });
   it('cancels analytical finalization while reading real retained source chunks', async () => {
     const controller = new AbortController();
     respond = () => Response.json(page([filing()]));
+    const { state } = tenant;
     const get = state.get.bind(state);
     const finalizationReads: string[] = [];
     const intercepted = vi.spyOn(state, 'get').mockImplementation(async (...args) => {
@@ -910,6 +748,7 @@ describe('LDA runtime contracts', () => {
         annual_ledgers: 0,
         selections: 0,
         firms: 0,
+        clients: 0,
         issue_codes: 0,
         targeted_entities: 0,
         selected_filings: 0,
@@ -937,8 +776,8 @@ describe('LDA runtime contracts', () => {
       { page_size: -1 },
       { page_size: 1.5 },
       { max_pages: Infinity },
-      { record_limit: 'abc' },
-      { record_limit: NaN },
+      { page_size: 'abc' },
+      { page_size: NaN },
     ]) {
       const output = await invoke(tool, { ...input, ...extra });
       expect(output.result.isError).toBe(true);
@@ -956,17 +795,11 @@ describe('LDA runtime contracts', () => {
   it.each(modes)(
     '$name clamps delivery controls and preserves filter identity',
     async ({ tool, input }) => {
-      const output = success(
-        await invoke(tool, { ...input, page_size: 26, max_pages: 6, record_limit: 26 }),
-      );
-      expect(output.delivery_limits).toMatchObject({
-        page_size: { requested: 26, effective: 25 },
-        max_pages: { requested: 6, effective: 5 },
-        record_limit: { requested: 26, effective: 25 },
-      });
-      expect(output.effective_filters).toMatchObject({ page_size: 25 });
+      // 20 is under every mode's page_size ceiling; per-mode caps are covered in delivery.test.ts.
+      const output = success(await invoke(tool, { ...input, page_size: 20, max_pages: 6 }));
+      expect(output.delivery_limits).toEqual({ max_pages: { requested: 6, effective: 5 } });
+      expect(output.effective_filters).toMatchObject({ page_size: 20 });
       expect(output.effective_filters).not.toHaveProperty('max_pages');
-      expect(output.effective_filters).not.toHaveProperty('record_limit');
     },
   );
   it.each(modes)('$name rejects nonprogressing upstream pages', async ({ tool, input, row }) => {
@@ -980,8 +813,9 @@ describe('LDA runtime contracts', () => {
       next.searchParams.set('page', String(n + 1));
       return Response.json(page([filing(n)], n < 6 ? String(next) : null));
     };
+    // Fewer than page_size matches stay pending through all five pages, so the collecting page is short.
     const first = success(
-      await invoke(searchFilings, { filing_year: 2024, page_size: 1, max_pages: 5 }),
+      await invoke(searchFilings, { filing_year: 2024, page_size: 25, max_pages: 5 }),
     );
     expect(first.coverage).toMatchObject({ complete: false, pages_fetched: 5 });
     expect(first.filings).toHaveLength(5);
@@ -1017,6 +851,7 @@ describe('LDA runtime contracts', () => {
       annual_ledgers: 1,
       selections: 25,
       firms: 1,
+      clients: 25,
       issue_codes: 1,
       targeted_entities: 1,
       selected_filings: 25,
@@ -1058,7 +893,7 @@ describe('LDA runtime contracts', () => {
         future: { nested: [null, false, 'é🌲'] },
       })),
     );
-    expect(delivered).toBe(104);
+    expect(delivered).toBe(129);
     expect(calls.filter((url) => url.pathname === '/api/v1/filings/')).toHaveLength(1);
   });
   it('keeps all 25 rows and traverses omitted/repeated filters, replay and changed scope', async () => {
@@ -1137,6 +972,7 @@ describe('LDA runtime contracts', () => {
       annual_ledgers: 1,
       selections: 1,
       firms: 0,
+      clients: 0,
       issue_codes: 0,
       targeted_entities: 0,
       selected_filings: 0,
@@ -1186,6 +1022,7 @@ describe('LDA runtime contracts', () => {
       annual_ledgers: 1,
       selections: 2,
       firms: 1,
+      clients: 2,
       issue_codes: 1,
       targeted_entities: 1,
       selected_filings: 2,
@@ -1196,6 +1033,7 @@ describe('LDA runtime contracts', () => {
       annual_ledgers: 0,
       selections: 0,
       firms: 0,
+      clients: 0,
       issue_codes: 0,
       targeted_entities: 0,
       selected_filings: 0,
@@ -1294,56 +1132,16 @@ describe('LDA runtime contracts', () => {
       expect(calls).toEqual([]);
     },
   );
-  it('returns a complete nested oversized parent through handle paths and exact Unicode windows', async () => {
+  it('returns a complete nested oversized parent with exact Unicode text', async () => {
     const long = 'é🌲'.repeat(9000);
     respond = () => Response.json(page([filing(1, { future: { nested: [{ text: long }] } })]));
     const first = success(await invoke(searchFilings, { filing_year: 2024 }));
-    expect(first).toMatchObject({ filings: [], records_deferred: 1 });
-    const handle = z
-      .array(z.object({ record_handle: z.string() }))
-      .parse(first.record_handles)[0]!.record_handle;
-    const nested = success(
-      await invoke(searchFilings, { record_handle: handle, record_path: '/future/nested' }),
-    );
-    expect(nested.record_window).toMatchObject({
-      kind: 'array',
-      items: [{ index: 0, path: '/future/nested/0' }],
+    expect(first).toMatchObject({
+      records_returned: 1,
+      output_complete: true,
+      filings: [{ filing_uuid: uuid(1), future: { nested: [{ text: long }] } }],
     });
-    const window = success(
-      await invoke(searchFilings, {
-        record_handle: handle,
-        record_path: '/future/nested/0/text',
-        record_offset: 1,
-        record_limit: 25,
-      }),
-    );
-    const fragment = z.object({ text: z.string() }).parse(window.record_window).text;
-    const codePoints = Array.from(fragment).length;
-    expect(codePoints).toBeGreaterThan(25);
-    expect(fragment).toBe(
-      Array.from(long)
-        .slice(1, 1 + codePoints)
-        .join(''),
-    );
-    expect(window.record_window).toMatchObject({
-      kind: 'string',
-      offset: 1,
-      returned: codePoints,
-      total: 18000,
-      complete: false,
-      next_offset: 1 + codePoints,
-    });
-    const past = success(
-      await invoke(searchFilings, {
-        record_handle: handle,
-        record_path: '/future/nested/0/text',
-        record_offset: 18000,
-      }),
-    );
-    expect(past.record_window).toMatchObject({ text: '', returned: 0, complete: true });
-    reason(
-      await invoke(searchFilings, { record_handle: handle, filing_year: 2024 }),
-      'invalid_filter',
-    );
+    const removed = await invoke(searchFilings, { record_handle: 'handle', filing_year: 2024 });
+    expect(removed.data).toMatchObject({ error: { code: -32602 } });
   });
 });

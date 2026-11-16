@@ -25,6 +25,7 @@ import {
   faraDetailEnvelopeSchema,
 } from '@/domain/fara.js';
 import { IdSchema, JsonValueSchema, normalizeSourceId } from '@/domain/json.js';
+import { SingleFlight } from '@/services/single-flight.js';
 import type { FaraDetail, FaraSearch, FaraSourceResult, FaraStatus } from './types.js';
 
 const ORIGIN = 'https://efile.fara.gov';
@@ -47,20 +48,16 @@ const xmlParser = new XMLParser({
     throw schemaFailure();
   },
 });
-type SnapshotKind = 'registrants' | 'foreign_principals';
+type SnapshotKind = 'registrants' | 'foreign_principals' | 'short_forms';
+type XmlRow = z.infer<typeof xmlRow>;
 interface Snapshot {
   lastModified?: string;
   records: FaraRecord[];
   retrievedAt: string;
   url: string;
 }
-interface Flight {
-  controller: AbortController;
-  promise: Promise<Snapshot>;
-  waiters: number;
-}
 const snapshots = new Map<SnapshotKind, Snapshot>();
-const flights = new Map<SnapshotKind, Flight>();
+const flights = new SingleFlight<SnapshotKind, Snapshot>();
 
 function schemaFailure(cause?: unknown): McpError {
   return new McpError(
@@ -107,11 +104,90 @@ function dates(
 function listing(status: FaraStatus = 'active'): string {
   return `${ORIGIN}/api/v1/Registrants/html/${status === 'terminated' ? 'Terminated' : 'Active'}`;
 }
-function field(raw: z.infer<typeof xmlRow>, key: string): string | undefined {
+function field(raw: XmlRow, key: string): string | undefined {
   const value = raw[key];
   if (value !== undefined && typeof value !== 'string') throw schemaFailure();
   return value;
 }
+/** A non-blank termination date ends the selected entity, whatever its registrant's status. */
+function statusOf(termination: string | null | undefined): NonNullable<FaraRecord['status']> {
+  return termination?.trim() ? 'terminated' : 'active';
+}
+/** A blank or absent name part is undisclosed; a row with neither keeps an empty name. */
+function person(first: string | null | undefined, last: string | null | undefined) {
+  return {
+    name: [first, last].filter(Boolean).join(' '),
+    ...(first ? { first_name: first } : {}),
+    ...(last ? { last_name: last } : {}),
+  };
+}
+/** Daily bulk archives: ZIP noun, XML root element, and each row's normalized record. */
+const ARCHIVES: Record<
+  SnapshotKind,
+  { noun: string; root: string; record: (raw: XmlRow) => FaraRecord }
+> = {
+  registrants: {
+    noun: 'Registrants',
+    root: 'REGISTRANTS',
+    record(raw) {
+      const name = field(raw, 'Name');
+      if (name === undefined) throw schemaFailure();
+      const termination = field(raw, 'Termination_Date');
+      const status = statusOf(termination);
+      return {
+        registration_number: sourceParse(IdSchema, raw.Registration_Number),
+        name,
+        entity: 'registrants',
+        status,
+        ...dates(field(raw, 'Registration_Date'), termination),
+        listing_url: listing(status),
+        raw,
+      };
+    },
+  },
+  foreign_principals: {
+    noun: 'ForeignPrincipals',
+    root: 'FOREIGNPRINCIPALS',
+    record(raw) {
+      const name = field(raw, 'Foreign_principal');
+      if (name === undefined) throw schemaFailure();
+      const termination = field(raw, 'FP_termination_date');
+      const status = statusOf(termination);
+      const registrantName = field(raw, 'Registrant_name');
+      const country = field(raw, 'Country_location_represented');
+      return {
+        registration_number: sourceParse(IdSchema, raw.Registration_number),
+        name,
+        entity: 'foreign_principals',
+        status,
+        ...dates(field(raw, 'FP_registration_date'), termination),
+        ...(registrantName !== undefined && { registrant_name: registrantName }),
+        ...(country !== undefined && { country }),
+        listing_url: listing(status),
+        raw,
+      };
+    },
+  },
+  short_forms: {
+    noun: 'ShortForms',
+    root: 'SHORTFORM_REGISTRANTS',
+    record(raw) {
+      const termination = field(raw, 'Short_form_termination_date');
+      const status = statusOf(termination);
+      const registrantName = field(raw, 'Registrant_name');
+      return {
+        registration_number: sourceParse(IdSchema, raw.Registration_number),
+        ...person(field(raw, 'Short_form_first_name'), field(raw, 'Short_form_last_name')),
+        entity: 'short_forms',
+        status,
+        ...dates(field(raw, 'Short_form_date'), termination),
+        ...(registrantName !== undefined && { registrant_name: registrantName }),
+        listing_url: listing(status),
+        raw,
+      };
+    },
+  },
+};
 function callSignal(signal: AbortSignal, deadlineAtMs: number): AbortSignal {
   signal.throwIfAborted();
   const remainingMs = Math.min(TOOL_DEADLINE_MS, deadlineAtMs - Date.now());
@@ -244,7 +320,7 @@ export class FaraService {
   }
 
   private async loadSnapshot(kind: SnapshotKind, signal: AbortSignal): Promise<Snapshot> {
-    const noun = kind === 'registrants' ? 'Registrants' : 'ForeignPrincipals';
+    const { noun, root, record } = ARCHIVES[kind];
     const path = `/bulk/zip/FARA_All_${noun}.xml.zip`;
     try {
       return await this.request(path, signal, TOOL_DEADLINE_MS, (bytes, response, parseSignal) => {
@@ -266,45 +342,20 @@ export class FaraService {
           throw schemaFailure(cause);
         }
         const json = sourceParse(JsonValueSchema, parsed);
-        const rootName = kind === 'registrants' ? 'REGISTRANTS' : 'FOREIGNPRINCIPALS';
         const envelope = sourceParse(
-          z.object({ [rootName]: z.object({ ROW: z.union([xmlRow, z.array(xmlRow)]) }) }),
+          z.object({ [root]: z.object({ ROW: z.union([xmlRow, z.array(xmlRow)]) }) }),
           json,
         );
-        const collection = envelope[rootName];
+        const collection = envelope[root];
         if (!collection) throw schemaFailure();
         const rows = Array.isArray(collection.ROW) ? collection.ROW : [collection.ROW];
-        const principal = kind === 'foreign_principals';
         const records: FaraRecord[] = [];
         for (const row of rows) {
           parseSignal.throwIfAborted();
           const { '#text': layout, ...raw } = row;
           if (layout !== undefined && (typeof layout !== 'string' || layout.trim() !== ''))
             throw schemaFailure();
-          const id = sourceParse(
-            IdSchema,
-            raw[principal ? 'Registration_number' : 'Registration_Number'],
-          );
-          const name = field(raw, principal ? 'Foreign_principal' : 'Name');
-          const termination = field(raw, principal ? 'FP_termination_date' : 'Termination_Date');
-          if (name === undefined) throw schemaFailure();
-          const status = termination?.trim() ? 'terminated' : 'active';
-          const registrantName = principal ? field(raw, 'Registrant_name') : undefined;
-          const country = principal ? field(raw, 'Country_location_represented') : undefined;
-          records.push({
-            registration_number: id,
-            name,
-            entity: kind,
-            status,
-            ...dates(
-              field(raw, principal ? 'FP_registration_date' : 'Registration_Date'),
-              termination,
-            ),
-            ...(registrantName !== undefined && { registrant_name: registrantName }),
-            ...(country !== undefined && { country }),
-            listing_url: listing(status),
-            raw,
-          });
+          records.push(record(raw));
         }
         const lastModified = response.headers.get('last-modified');
         return {
@@ -334,43 +385,11 @@ export class FaraService {
     signal.throwIfAborted();
     const cached = snapshots.get(kind);
     if (cached && Date.now() - Date.parse(cached.retrievedAt) < SOURCE_CACHE_TTL_MS) return cached;
-    let flight = flights.get(kind);
-    if (!flight) {
-      const controller = new AbortController();
-      const created: Flight = {
-        controller,
-        waiters: 0,
-        promise: this.loadSnapshot(kind, controller.signal),
-      };
-      created.promise = created.promise
-        .then((value) => {
-          snapshots.set(kind, value);
-          return value;
-        })
-        .finally(() => {
-          if (flights.get(kind) === created) flights.delete(kind);
-        });
-      flights.set(kind, created);
-      flight = created;
-    }
-    const current = flight;
-    current.waiters++;
-    try {
-      return await new Promise<Snapshot>((resolve, reject) => {
-        const cancelled = () => reject(signal.reason);
-        signal.addEventListener('abort', cancelled, { once: true });
-        current.promise
-          .then(resolve, reject)
-          .finally(() => signal.removeEventListener('abort', cancelled));
-      });
-    } finally {
-      current.waiters--;
-      if (current.waiters === 0 && flights.get(kind) === current) {
-        current.controller.abort();
-        flights.delete(kind);
-        await current.promise.catch(() => undefined);
-      }
-    }
+    return await flights.join(kind, signal, async (flightSignal) => {
+      const loaded = await this.loadSnapshot(kind, flightSignal);
+      snapshots.set(kind, loaded);
+      return loaded;
+    });
   }
 
   /** Filter the entire selected daily snapshot; results are ready to pin into a continuation. */
@@ -385,10 +404,14 @@ export class FaraService {
       throw validationError('Country requires foreign_principals.', { reason: 'invalid_filter' });
     const selected = await this.snapshot(entity, scope);
     const registrants =
-      entity === 'foreign_principals' ? await this.snapshot('registrants', scope) : undefined;
+      entity === 'registrants' ? undefined : await this.snapshot('registrants', scope);
     const byId = new Map(registrants?.records.map((row) => [row.registration_number, row.status]));
-    const tokens =
-      input.name_contains?.trim().toLocaleLowerCase('en-US').split(/\s+/).filter(Boolean) ?? [];
+    // Distinct tokens: every row is checked against each token once.
+    const tokens = [
+      ...new Set(
+        input.name_contains?.trim().toLocaleLowerCase('en-US').split(/\s+/).filter(Boolean),
+      ),
+    ];
     const status = input.status ?? 'active';
     const country = input.country?.trim().toLocaleLowerCase('en-US');
     if (
@@ -402,22 +425,18 @@ export class FaraService {
     const records: FaraRecord[] = [];
     for (const row of selected.records) {
       scope.throwIfAborted();
-      if (
-        (status === 'all' || row.status === status) &&
-        tokens.every((token) => row.name.toLocaleLowerCase('en-US').includes(token)) &&
-        (!country || row.country?.toLocaleLowerCase('en-US') === country)
-      ) {
-        const registrantStatus = byId.get(row.registration_number);
-        records.push(
-          registrantStatus
-            ? {
-                ...row,
-                registrant_status: registrantStatus,
-                listing_url: listing(registrantStatus),
-              }
-            : row,
-        );
+      if (status !== 'all' && row.status !== status) continue;
+      if (country && row.country?.toLocaleLowerCase('en-US') !== country) continue;
+      if (tokens.length > 0) {
+        const name = row.name.toLocaleLowerCase('en-US');
+        if (!tokens.every((token) => name.includes(token))) continue;
       }
+      const registrantStatus = byId.get(row.registration_number);
+      records.push(
+        registrantStatus
+          ? { ...row, registrant_status: registrantStatus, listing_url: listing(registrantStatus) }
+          : row,
+      );
     }
     const urls = (registrants ? [selected, registrants] : [selected]).map((value) => value.url);
     return {
@@ -429,7 +448,9 @@ export class FaraService {
       snapshot_source_urls: [...urls],
       ...(selected.lastModified !== undefined && { snapshot_last_modified: selected.lastModified }),
       notices: [
-        'FARA search uses complete daily snapshots; principal status is independent of registrant status.',
+        entity === 'short_forms'
+          ? 'FARA search uses complete daily snapshots; short-form status is independent of registrant status. Short-form matches are name matches and establish no identity across registrations or with LDA lobbyists.'
+          : 'FARA search uses complete daily snapshots; principal status is independent of registrant status.',
       ],
     };
   }
@@ -491,17 +512,18 @@ export class FaraService {
             throw schemaFailure(cause);
           }
           const json = sourceParse(JsonValueSchema, value);
-          const rows = <T>(wire: z.ZodType<T>): T[] => {
-            const rowset = sourceParse(faraDetailEnvelopeSchema(wire), json).ROWSET;
+          // Each row parsed by its wire schema, beside the source row exactly as FARA sent it.
+          const rows = <T>(wire: z.ZodType<T>): [T, XmlRow][] => {
+            const rowset = sourceParse(faraDetailEnvelopeSchema(xmlRow), json).ROWSET;
             const list = rowset === '' ? [] : Array.isArray(rowset.ROW) ? rowset.ROW : [rowset.ROW];
-            return list.map((row) => {
+            return list.map((source) => {
               parseSignal.throwIfAborted();
-              return row;
+              return [sourceParse(wire, source), source];
             });
           };
           switch (detail) {
             case 'documents':
-              return rows(FaraDocumentWireSchema).map((doc) => {
+              return rows(FaraDocumentWireSchema).map(([doc, raw]) => {
                 const stamped = calendar(doc.DATE_STAMPED);
                 return {
                   registration_number: normalizeSourceId(doc.REGISTRATION_NUMBER),
@@ -524,37 +546,35 @@ export class FaraService {
                   }),
                   document_url: doc.URL,
                   listing_url: listing(),
-                  raw: xmlRow.parse(doc),
+                  raw,
                 };
               });
             case 'foreign_principals':
-              return rows(FaraPrincipalWireSchema).map((principal) => ({
+              return rows(FaraPrincipalWireSchema).map(([principal, raw]) => ({
                 registration_number: normalizeSourceId(principal.REG_NUMBER),
                 name: principal.FP_NAME,
                 entity: 'foreign_principals',
                 status: statuses[index],
-                ...dates(principal.FP_REG_DATE),
+                ...dates(principal.FP_REG_DATE, principal.TERMINATION_DATE),
                 ...(principal.REGISTRANT_NAME !== undefined && {
                   registrant_name: principal.REGISTRANT_NAME,
                 }),
                 ...(principal.COUNTRY_NAME !== undefined && { country: principal.COUNTRY_NAME }),
                 listing_url: listing(),
-                raw: xmlRow.parse(principal),
+                raw,
               }));
             case 'short_forms':
-              return rows(FaraShortFormWireSchema).map((short) => ({
+              return rows(FaraShortFormWireSchema).map(([short, raw]) => ({
                 registration_number: normalizeSourceId(short.REG_NUMBER),
-                name: [short.SF_FIRST_NAME, short.SF_LAST_NAME].filter(Boolean).join(' '),
+                ...person(short.SF_FIRST_NAME, short.SF_LAST_NAME),
                 entity: 'short_forms',
                 status: statuses[index],
-                ...dates(short.SHORTFORM_DATE),
-                ...(short.SF_FIRST_NAME !== undefined && { first_name: short.SF_FIRST_NAME }),
-                last_name: short.SF_LAST_NAME,
+                ...dates(short.SHORTFORM_DATE, short.SF_TERM_DATE),
                 ...(short.REGISTRANT_NAME !== undefined && {
                   registrant_name: short.REGISTRANT_NAME,
                 }),
                 listing_url: listing(),
-                raw: xmlRow.parse(short),
+                raw,
               }));
           }
         },

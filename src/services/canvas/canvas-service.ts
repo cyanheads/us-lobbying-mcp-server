@@ -19,11 +19,15 @@ import {
   type Dataset,
   DatasetSchema,
   DatasetTableSchema,
-  FULL_RESULT_TARGET_BYTES,
   ProvenanceSchema,
   QueryWindowSchema,
 } from '@/domain/contracts.js';
-import { fullResultBytes } from '@/domain/format.js';
+import {
+  CEILINGS,
+  deliveryDisclosure,
+  normalizeDelivery,
+  recordClamps,
+} from '@/domain/delivery-limits.js';
 import { JsonValueSchema } from '@/domain/json.js';
 import type { ActivityRow, Filing } from '@/domain/lda.js';
 import type { FilingSelection } from '@/services/lobbying/analysis.js';
@@ -79,7 +83,7 @@ function pointers(canvasId: string, names: string[]) {
     canvas_id: canvasId,
     describe_tool: DESCRIBE,
     query_tool: QUERY,
-    guidance: `Inspect ${names.length ? names.join(', ') : 'available tables'} with ${DESCRIBE}, then use ${QUERY} with this canvas_id; result_table windows use canonical value ordering.`,
+    guidance: `Inspect ${names.length ? names.join(', ') : 'available tables'} with ${DESCRIBE}, then use ${QUERY} with this canvas_id; result_table windows follow the materialized SQL result order set by a top-level ORDER BY, which an ORDER BY only inside a CTE or subquery does not guarantee.`,
   };
 }
 
@@ -216,7 +220,7 @@ async function tableMetadata(instance: CanvasInstance, table: TableInfo, ctx: Co
 }
 
 async function dataset(instance: CanvasInstance, names: string[], ctx: Context): Promise<Dataset> {
-  const tables = await instance.describe();
+  const tables = await instance.describe({ signal: ctx.signal });
   const selected = [];
   for (const name of names) {
     const table = tables.find((entry) => entry.name === name);
@@ -269,20 +273,23 @@ export async function stageFilings(input: StageFilingsInput, ctx: Context): Prom
       for (const id of selection.candidate_filing_uuids)
         decisions.set(id, { ...common, selection_status: selection.status });
     }
-    const existing = new Set((await instance.describe()).map((table) => table.name));
+    const existing = new Set(
+      (await instance.describe({ signal: ctx.signal })).map((table) => table.name),
+    );
     const registrations = [
       {
         prefix: 'raw_filings',
         rows: filingRows(input.raw_filings, decisions, ctx.signal),
         schema: filingColumns,
-        grain: 'One acquired filing version per filing_uuid; all amendments retained.',
+        grain:
+          'One acquired filing version per filing_uuid; all amendments retained. selection_status records version selection before any issue filter.',
       },
       {
         prefix: 'selected_filings',
         rows: filingRows(input.selected_filings, decisions, ctx.signal),
         schema: filingColumns,
         grain:
-          'One unambiguous latest posted quarterly filing per registrant/client/year/period, after local predicates; income and expenses remain separate.',
+          'One unambiguous latest posted quarterly or semiannual filing per registrant/client/year/period, after local predicates; income and expenses remain separate.',
       },
       {
         prefix: 'activities',
@@ -341,23 +348,19 @@ export async function describeCanvas(
 ) {
   return await operate(input.canvas_id, ctx, async (instance) => {
     ctx.signal.throwIfAborted();
-    const tables = await instance.describe(
-      input.table_name === undefined ? undefined : { tableName: input.table_name },
-    );
+    const tables = await instance.describe({
+      signal: ctx.signal,
+      ...(input.table_name !== undefined && { tableName: input.table_name }),
+    });
     if (input.table_name !== undefined && tables.length === 0) throw missing(input.table_name);
     const metadata = [];
-    const routing = pointers(
-      instance.canvasId,
-      tables.map((table) => table.name),
-    );
-    for (const table of tables) {
-      metadata.push(await tableMetadata(instance, table, ctx));
-      if (fullResultBytes({ ...routing, tables: metadata }) > FULL_RESULT_TARGET_BYTES)
-        throw oversized(instance, table.name);
-    }
+    for (const table of tables) metadata.push(await tableMetadata(instance, table, ctx));
     ctx.signal.throwIfAborted();
     return {
-      ...routing,
+      ...pointers(
+        instance.canvasId,
+        tables.map((table) => table.name),
+      ),
       tables: metadata,
     };
   });
@@ -369,25 +372,24 @@ export type CanvasQueryInput = { canvas_id: string; row_limit?: number } & (
   | { result_table: string; offset?: number; sql?: never; register_as?: never }
 );
 
-function oversized(instance: CanvasInstance, name: string): McpError {
-  return validationError('A complete query row or its metadata exceeds the response byte budget.', {
-    reason: 'query_row_too_large',
-    ...pointers(instance.canvasId, [name]),
-    result_table: name,
-    recovery: {
-      hint: `Call ${DESCRIBE} to inspect ${name}, then use ${QUERY} with a fresh SELECT projecting fewer columns or explicit SUBSTR windows of the oversized value. The complete result remains staged as ${name}.`,
-    },
-  });
-}
-
-/** Materialize complete SELECT results, then deliver whole rows within the complete wire budget. */
+/**
+ * Materialize complete SELECT results, then deliver exactly `min(row_limit, remaining)` whole rows.
+ * @throws `ValidationError` (`invalid_filter`) for an offset past `row_count`, or a `row_limit` over
+ * its ceiling when `USLOBBYING_CLAMP_LIMITS=false`.
+ */
 export async function queryCanvas(input: CanvasQueryInput, ctx: Context) {
-  const requested = input.row_limit ?? 25;
-  if (!Number.isFinite(requested) || !Number.isInteger(requested) || requested < 1)
+  // `multipleOf(1)` admits float noise such as 20.000000000000004; it has one reading, the integer.
+  const requested = Math.round(input.row_limit ?? 25);
+  if (!Number.isFinite(requested) || requested < 1)
     throw validationError('row_limit must be a positive integer.', {
       reason: 'invalid_filter',
     });
-  const rowLimit = Math.min(requested, 100, configuredRowLimit ?? config.canvas.defaultRowLimit);
+  const { row_limit: served } = normalizeDelivery({ row_limit: requested }, CEILINGS.sql);
+  const { delivery_limits } = deliveryDisclosure({ row_limit: requested }, CEILINGS.sql);
+  const rowLimit = Math.min(served, configuredRowLimit ?? config.canvas.defaultRowLimit);
+  // A lower provider ceiling is the limit this call applies, so the disclosure reports it.
+  if (rowLimit < served) delivery_limits.row_limit = { requested, effective: rowLimit };
+  recordClamps(ctx, QUERY, delivery_limits);
   return await operate(input.canvas_id, ctx, async (instance) => {
     let name: string;
     let offset: number;
@@ -427,12 +429,15 @@ export async function queryCanvas(input: CanvasQueryInput, ctx: Context) {
         reason: 'invalid_filter',
       });
     try {
-      return await queryWindow(instance, name, offset, rowLimit, requested, ctx);
+      return {
+        ...QueryWindowSchema.parse({
+          delivery_limits,
+          ...(await queryWindow(instance, name, offset, rowLimit, ctx)),
+        }),
+        ...(rowLimit < requested && { effective_row_limit: rowLimit }),
+      };
     } catch (error) {
-      if (
-        input.sql !== undefined &&
-        !(error instanceof McpError && error.data?.reason === 'query_row_too_large')
-      ) {
+      if (input.sql !== undefined) {
         try {
           await cleanup(instance, [name], ctx);
         } catch (cleanupError) {
@@ -448,18 +453,18 @@ export async function queryCanvas(input: CanvasQueryInput, ctx: Context) {
   });
 }
 
+/**
+ * Read one window of a materialized result in its stored order. CREATE TABLE … AS stores rows in
+ * the SQL's top-level ORDER BY order under DuckDB's default `preserve_insertion_order`, which the
+ * canvas leaves on, and a plain LIMIT/OFFSET scan reads that order back unchanged.
+ */
 async function queryWindow(
   instance: CanvasInstance,
   name: string,
   offset: number,
   rowLimit: number,
-  requested: number,
   ctx: Context,
 ) {
-  const result = await instance.query(
-    `SELECT * FROM ${quoteIdentifier(name)} ORDER BY ALL LIMIT ${rowLimit} OFFSET ${offset}`,
-    { rowLimit, signal: ctx.signal },
-  );
   const staged = await dataset(instance, [name], ctx);
   const table = staged.tables[0];
   if (!table) throw missing(name);
@@ -467,42 +472,26 @@ async function queryWindow(
     throw validationError('offset exceeds the materialized result row count.', {
       reason: 'invalid_filter',
     });
+  const result = await instance.query(
+    `SELECT * FROM ${quoteIdentifier(name)} LIMIT ${rowLimit} OFFSET ${offset}`,
+    { rowLimit, signal: ctx.signal },
+  );
   const rows = z.array(z.record(z.string(), JsonValueSchema)).parse(result.rows);
-  const output = (delivered: typeof rows) => ({
+  const end = offset + rows.length;
+  ctx.signal.throwIfAborted();
+  return {
     ...pointers(instance.canvasId, [name]),
     dataset: staged,
     result_table: name,
     columns: table.columns,
-    rows: delivered,
+    rows,
     row_count: table.row_count,
-    rows_returned: delivered.length,
+    rows_returned: rows.length,
     offset,
-    ...(offset + delivered.length < table.row_count && {
-      next_offset: offset + delivered.length,
-    }),
-    output_complete: offset + delivered.length >= table.row_count,
-    truncated: offset + delivered.length < table.row_count,
-    row_order: 'canonical_values' as const,
-    ...(rowLimit < requested && { effective_row_limit: rowLimit }),
-    ...(rowLimit < requested && {
-      delivery_limits: { row_limit: { requested, effective: rowLimit } },
-    }),
-  });
-  const delivered: typeof rows = [];
-  if (fullResultBytes(output(delivered)) > FULL_RESULT_TARGET_BYTES)
-    throw oversized(instance, name);
-  for (const row of rows) {
-    delivered.push(row);
-    if (fullResultBytes(output(delivered)) > FULL_RESULT_TARGET_BYTES) {
-      delivered.pop();
-      if (delivered.length === 0) throw oversized(instance, name);
-      break;
-    }
-  }
-  ctx.signal.throwIfAborted();
-  return {
-    ...QueryWindowSchema.parse(output(delivered)),
-    ...(rowLimit < requested && { effective_row_limit: rowLimit }),
+    ...(end < table.row_count && { next_offset: end }),
+    output_complete: end >= table.row_count,
+    truncated: end < table.row_count,
+    row_order: 'sql_result' as const,
   };
 }
 

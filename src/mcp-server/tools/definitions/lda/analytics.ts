@@ -6,13 +6,22 @@ import { ActivityRowSchema, FilingSchema, GovernmentEntitySchema } from '@/domai
 import { acquire } from '@/services/acquisition/acquisition-service.js';
 import { getCanvas, stageFilings } from '@/services/canvas/canvas-service.js';
 import { analyzeFilings } from '@/services/lobbying/analysis.js';
-import { deliveryShape, envelope, provenance, source } from './shared.js';
+import {
+  deliveryShape,
+  envelope,
+  projectActivity,
+  projectFiling,
+  provenance,
+  type Scope,
+  source,
+} from './shared.js';
 
 const RowSetCounts = z
   .object({
     annual_ledgers: z.number().int().nonnegative().describe('Annual ledger records.'),
     selections: z.number().int().nonnegative().describe('Version-selection decisions.'),
     firms: z.number().int().nonnegative().describe('Firm breakdown records.'),
+    clients: z.number().int().nonnegative().describe('Client relationship breakdown records.'),
     issue_codes: z.number().int().nonnegative().describe('Issue breakdown records.'),
     targeted_entities: z.number().int().nonnegative().describe('Targeted entity records.'),
     selected_filings: z.number().int().nonnegative().describe('Selected filing records.'),
@@ -28,7 +37,7 @@ export const rowSetsInput = z
   .refine((sets) => new Set(sets).size === sets.length, 'row_sets must contain unique names.')
   .optional()
   .describe(
-    'Inline analytical sets; omit for all sets. Selection never limits acquisition, totals or SQL staging. Omitted sets remain available from a new call with another selection or staged tables. Continue with omitted or equivalent row_sets.',
+    'Inline analytical sets; omit for all sets. Selection never limits acquisition, totals or SQL staging. Omitted sets remain available from a new call with another selection or staged tables. On a continuation, omit row_sets or list the sets of the first call in any order; listing every set after a first call that omitted row_sets fails cursor_invalid.',
   );
 
 const Ledger = z
@@ -47,7 +56,12 @@ const Ledger = z
     missing_amount_count: z.number().int().describe('Filings with neither amount known.'),
     missing_income_count: z.number().int().describe('Filings missing income.'),
     missing_expense_count: z.number().int().describe('Filings missing expenses.'),
-    ambiguous_group_count: z.number().int().describe('Equal-latest groups excluded from sums.'),
+    ambiguous_group_count: z
+      .number()
+      .int()
+      .describe(
+        'Equal-latest groups excluded from sums; counted on annual_ledgers, always 0 on firm, client and issue breakdown ledgers.',
+      ),
     matching_filing_count: z.number().int().describe('Selected matching filings.'),
     multi_issue_filing_count: z.number().int().describe('Filings mentioning more than one issue.'),
     expense_methods: z
@@ -79,9 +93,17 @@ const Selection = z
       .describe('Analytical selection rule, not legal lineage.'),
     status: z.enum(['selected', 'ambiguous', 'excluded']).describe('Selection outcome.'),
     exclusion_reason: z
-      .enum(['registration', 'non_quarterly', 'unknown_variant', 'missing_relationship'])
+      .enum([
+        'registration',
+        'non_quarterly',
+        'off_cycle_period',
+        'unknown_variant',
+        'missing_relationship',
+      ])
       .optional()
-      .describe('Why excluded.'),
+      .describe(
+        'Why excluded. non_quarterly: a period that is neither quarterly nor semiannual. off_cycle_period: a quarterly period through 2007 or semiannual period from 2008, in a registrant/client/year that also filed the statutory grain.',
+      ),
   })
   .describe('Latest-version selection and excluded candidates.');
 const Firm = z
@@ -93,6 +115,15 @@ const Firm = z
     annual_ledgers: z.array(Ledger).describe('Firm year ledgers.'),
   })
   .describe('Firm breakdown.');
+const Client = z
+  .object({
+    client_id: z.string().describe('Client relationship record ID.'),
+    name: z.string().describe('Client name.'),
+    registrant_id: z.string().describe('Firm ID of this relationship.'),
+    filing_uuids: z.array(z.string()).describe('Selected report UUIDs.'),
+    annual_ledgers: z.array(Ledger).describe('Relationship year ledgers.'),
+  })
+  .describe('Client relationship breakdown; each selected filing belongs to exactly one.');
 const Issue = z
   .object({
     issue_code: z.string().describe('Issue code.'),
@@ -135,6 +166,10 @@ const AnalyticalRow = z.discriminatedUnion('kind', [
     firm: Firm,
   }),
   z.object({
+    kind: z.literal('client'),
+    client: Client,
+  }),
+  z.object({
     kind: z.literal('issue'),
     issue: Issue,
   }),
@@ -155,7 +190,7 @@ export const analyticalShape = {
     'Exact all-set totals after acquisition completes.',
   ),
   row_set_offsets: RowSetCounts.optional().describe(
-    'Selected-set rows delivered or deferred before this window; others zero.',
+    'Selected-set rows delivered before this window; others zero.',
   ),
   status: z
     .enum(['collecting', 'complete'])
@@ -166,7 +201,13 @@ export const analyticalShape = {
     .describe('Complete-year ledgers in this window; absent while collecting.'),
   selections: z.array(Selection).optional().describe('Version-selection decisions in this window.'),
   firms: z.array(Firm).optional().describe('Firm breakdowns in this window.'),
-  issue_codes: z.array(Issue).optional().describe('Overlapping issue breakdowns in this window.'),
+  clients: z.array(Client).optional().describe('Client relationship breakdowns in this window.'),
+  issue_codes: z
+    .array(Issue)
+    .optional()
+    .describe(
+      'Overlapping issue breakdowns in this window; with issue_code set, every row covers only selected filings that also mention issue_code.',
+    ),
   targeted_entities: z
     .array(TargetedEntity)
     .optional()
@@ -174,15 +215,21 @@ export const analyticalShape = {
   selected_filings: z
     .array(FilingSchema)
     .optional()
-    .describe('Complete selected filings in this window.'),
+    .describe(
+      'Selected filings in this window; activity description and lobbyists appear only when include names them.',
+    ),
   raw_filings: z
     .array(FilingSchema)
     .optional()
-    .describe('All acquired versions in this window, including selected versions.'),
+    .describe(
+      'All acquired versions in this window, including selected versions; activity description and lobbyists appear only when include names them.',
+    ),
   activities: z
     .array(ActivityRowSchema)
     .optional()
-    .describe('Selected activities in this window; no money columns.'),
+    .describe(
+      'Selected activities in this window, with no money columns; description and lobbyists appear only when include names them.',
+    ),
   dataset: DatasetSchema.optional().describe(
     'Complete SQL metadata on the first final window and its replay.',
   ),
@@ -193,12 +240,12 @@ export const analyticalShape = {
     .object({
       selection_method: z
         .literal('latest_posted_within_relationship_period')
-        .describe('Latest posting within relationship and quarter.'),
+        .describe('Latest posting within relationship and reporting period, quarter or half-year.'),
       issue_buckets_overlap: z.literal(true).describe('Do not sum issue buckets.'),
       amounts_are_separate: z.literal(true).describe('Never combine income and expenses.'),
       client_identity: z
-        .literal('caller_selected_relationships')
-        .describe('No corporate identity is inferred.'),
+        .literal('relationship_records')
+        .describe('Each client is one relationship record; no corporate identity is inferred.'),
     })
     .describe('Accounting limitations.'),
 };
@@ -234,6 +281,9 @@ function analyticalLists(records: JsonValue[]): Record<string, JsonValue[]> {
       case 'firm':
         append('firms', row.firm);
         break;
+      case 'client':
+        append('clients', row.client);
+        break;
       case 'issue':
         append('issue_codes', row.issue);
         break;
@@ -260,14 +310,21 @@ function analyticalLists(records: JsonValue[]): Record<string, JsonValue[]> {
   }
   return lists;
 }
+/**
+ * Acquire every partition, then deliver `resolved.page_size` (default 25) analytical rows per window.
+ * `include` (default `[]`) projects only the delivered filing and activity rows; analysis, totals and
+ * canvas staging read the complete acquired filings.
+ */
 export function analyzeScope(
   ctx: Context,
   tool: string,
-  f: Record<string, JsonValue>,
-  input: { cursor?: string | undefined; max_pages?: number | undefined },
+  resolved: Scope,
+  cursor: string | undefined,
   partitions: Record<string, string | number | boolean>[],
   build: (base: object) => object,
 ) {
+  const f = resolved.filters;
+  f.include ??= [];
   const selected = new Set(
     z.array(z.string()).parse(f.row_sets ?? Object.keys(RowSetCounts.shape)),
   );
@@ -275,17 +332,18 @@ export function analyzeScope(
     selection_method: 'latest_posted_within_relationship_period',
     issue_buckets_overlap: true,
     amounts_are_separate: true,
-    client_identity: 'caller_selected_relationships',
+    client_identity: 'relationship_records',
   };
   return acquire(ctx, {
     tool,
     scanKind: 'analysis',
     filters: f,
-    ...(input.cursor ? { cursor: input.cursor } : {}),
-    maxPages: Math.min(input.max_pages ?? 5, 5),
+    ...(cursor ? { cursor } : {}),
+    pageSize: resolved.page_size ?? 25,
+    maxPages: resolved.max_pages ?? 5,
     retainAll: true,
     source: source('filings', partitions),
-    provenance: provenance(f, input),
+    provenance: provenance(f, resolved.delivery_limits),
     buildResponse: (w, meta, stored) => {
       const { dataset: staged, ...metadata } = meta ?? {};
       const dataset = staged === undefined ? undefined : DatasetSchema.parse(staged);
@@ -297,9 +355,9 @@ export function analyzeScope(
           ? 'No source filings were fetched for the completed scope; zero rows do not establish identifier validity.'
           : meta && RowSetCounts.parse(meta.row_set_totals).selected_filings > 0
             ? 'No rows belong to the selected inline row sets; inspect row_set_totals or request another selection.'
-            : 'Source filings were acquired, but no quarterly filings survived version and issue selection.',
+            : 'Source filings were acquired, but no filings survived version and issue selection.',
         stored,
-        input,
+        resolved.delivery_limits,
       );
       return build({
         ...base,
@@ -354,21 +412,34 @@ export function analyzeScope(
             yield JsonValueSchema.parse({ kind: 'selection', selection });
         if (selected.has('firms'))
           for (const firm of result.firms) yield JsonValueSchema.parse({ kind: 'firm', firm });
+        if (selected.has('clients'))
+          for (const client of result.clients)
+            yield JsonValueSchema.parse({ kind: 'client', client });
         if (selected.has('issue_codes'))
           for (const issue of result.issue_codes)
             yield JsonValueSchema.parse({ kind: 'issue', issue });
         if (selected.has('targeted_entities'))
           for (const entity of result.targeted_entities)
             yield JsonValueSchema.parse({ kind: 'targeted_entity', ...entity });
+        // Final rows store the include projection; staging above already read the complete filings.
         if (selected.has('selected_filings'))
           for (const filing of result.selected)
-            yield JsonValueSchema.parse({ kind: 'selected_filing', filing });
+            yield {
+              kind: 'selected_filing',
+              filing: projectFiling(JsonValueSchema.parse(filing), f.include),
+            };
         if (selected.has('activities'))
           for (const activity of result.activities)
-            yield JsonValueSchema.parse({ kind: 'activity', activity });
+            yield {
+              kind: 'activity',
+              activity: projectActivity(JsonValueSchema.parse(activity), f.include),
+            };
         if (selected.has('raw_filings'))
           for await (const filing of rawFilings())
-            yield JsonValueSchema.parse({ kind: 'raw_filing', filing });
+            yield {
+              kind: 'raw_filing',
+              filing: projectFiling(JsonValueSchema.parse(filing), f.include),
+            };
         // Notices use the same retained windows as records, so many empty partitions cannot inflate every response.
         for (const [index, observed] of Object.entries(checkpoint.partitions?.observed ?? {})) {
           const partition = partitions[Number(index)];
@@ -382,12 +453,22 @@ export function analyzeScope(
             notice: `No source filings were fetched for ${scope}; zero rows do not establish identifier validity.`,
           };
         }
-        if (coverage.records_fetched > 0 && result.selected.length === 0)
+        /**
+         * A year with acquired filings always has a ledger; one with nothing acquired has none and is
+         * named by its partition notice above. One notice per emptied year replaces a scope-wide one.
+         */
+        for (const { year, matching_filing_count } of result.annual_ledgers) {
+          if (matching_filing_count > 0) continue;
+          const kept = result.selections.filter(
+            (selection) => selection.year === year && selection.status === 'selected',
+          ).length;
           yield {
             kind: 'notice',
-            notice:
-              'Source filings were acquired, but no quarterly filings survived version and issue selection.',
+            notice: kept
+              ? `Version selection kept ${kept} filing${kept === 1 ? '' : 's'} for ${year}, but none mention issue_code ${String(f.issue_code)}.`
+              : `No filing acquired for ${year} survived version selection; its selections rows give each exclusion or ambiguity.`,
           };
+        }
       }
       return {
         records: rows(),
@@ -397,6 +478,7 @@ export function analyzeScope(
             annual_ledgers: result.annual_ledgers.length,
             selections: result.selections.length,
             firms: result.firms.length,
+            clients: result.clients.length,
             issue_codes: result.issue_codes.length,
             targeted_entities: result.targeted_entities.length,
             selected_filings: result.selected.length,

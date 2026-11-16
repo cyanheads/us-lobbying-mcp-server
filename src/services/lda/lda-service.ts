@@ -10,7 +10,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import { createPacer, type Pacer, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { EXCHANGE_DEADLINE_MS, TOOL_DEADLINE_MS } from '@/domain/contracts.js';
+import { EXCHANGE_DEADLINE_MS, SOURCE_CACHE_TTL_MS, TOOL_DEADLINE_MS } from '@/domain/contracts.js';
 import { IdSchema, JsonValueSchema } from '@/domain/json.js';
 import {
   ClientSchema,
@@ -22,6 +22,7 @@ import {
   normalizeLdaRecord,
   RegistrantSchema,
 } from '@/domain/lda.js';
+import { SingleFlight } from '@/services/single-flight.js';
 
 const BASE = 'https://lda.gov/api/v1/';
 const common = ['page', 'page_size', 'ordering'] as const;
@@ -150,6 +151,13 @@ const constantPaths = {
 } as const;
 /** Supported verified constant families. */
 export type LdaConstantTopic = keyof typeof constantPaths;
+type LdaConstant = z.infer<typeof LdaConstantSchema>;
+/** One topic's verified entries. `entries` is the shared cached array: copy it before mutating. */
+export interface LdaConstants {
+  entries: LdaConstant[];
+  /** ISO 8601 instant this instance fetched the entries; a cache hit reports that fetch. */
+  retrieved_at: string;
+}
 let sharedPacer: Pacer | undefined;
 let sharedAuthenticated: boolean | undefined;
 function sourcePacer(authenticated: boolean): Pacer {
@@ -171,6 +179,8 @@ export class LdaService {
   private readonly transport: typeof globalThis.fetch;
   private readonly apiKey: string | undefined;
   private readonly pacer: Pacer;
+  private readonly constantsCache = new Map<LdaConstantTopic, LdaConstants>();
+  private readonly constantsFlights = new SingleFlight<LdaConstantTopic, LdaConstants>();
   constructor(options: LdaServiceOptions = {}) {
     this.apiKey = options.apiKey;
     this.transport = options.fetch ?? globalThis.fetch;
@@ -392,19 +402,36 @@ export class LdaService {
   getLobbyist(id: string, options: LdaRequestOptions = {}) {
     return this.detail('lobbyists', id, LobbyistSchema, options);
   }
-  /** Fetch an official reference family. */
-  constants(topic: LdaConstantTopic, options: LdaRequestOptions = {}) {
+  /**
+   * Fetch an official reference family through this instance's 24-hour per-topic cache. Concurrent
+   * misses share one request; a failed or schema-invalid response is never cached, and a waiter's
+   * cancellation rejects only that waiter.
+   */
+  async constants(
+    topic: LdaConstantTopic,
+    options: Pick<LdaRequestOptions, 'signal'> = {},
+  ): Promise<LdaConstants> {
+    const { signal } = options;
+    signal?.throwIfAborted();
+    const cached = this.constantsCache.get(topic);
+    if (cached && Date.now() - Date.parse(cached.retrieved_at) < SOURCE_CACHE_TTL_MS) return cached;
+    return await this.constantsFlights.join(topic, signal, async (flightSignal) => {
+      const entries = await this.fetchConstants(topic, flightSignal);
+      const fetched = { entries, retrieved_at: new Date().toISOString() };
+      this.constantsCache.set(topic, fetched);
+      return fetched;
+    });
+  }
+  private fetchConstants(topic: LdaConstantTopic, signal: AbortSignal): Promise<LdaConstant[]> {
     const record =
       topic === 'government_entities'
         ? LdaConstantSchema.omit({ value: true })
             .extend({ id: IdSchema })
             .transform((entry) => ({ ...entry, value: entry.id }))
         : LdaConstantSchema;
-    return this.request(
-      new URL(`constants/${constantPaths[topic]}/`, BASE),
-      z.array(record),
-      options,
-    );
+    return this.request(new URL(`constants/${constantPaths[topic]}/`, BASE), z.array(record), {
+      signal,
+    });
   }
 }
 let service: LdaService | undefined;

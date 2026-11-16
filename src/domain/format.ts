@@ -36,11 +36,3 @@ export function formatResult(result: object): { type: 'text'; text: string }[] {
     { type: 'text', text: `${fence}json\n${json}\n${fence}${documents ? `\n\n${documents}` : ''}` },
   ];
 }
-/** Measure the two complete result surfaces with reserved transport-envelope bytes. */
-export function fullResultBytes(result: object): number {
-  return (
-    new TextEncoder().encode(
-      JSON.stringify({ content: formatResult(result), structuredContent: result }),
-    ).byteLength + 512
-  );
-}

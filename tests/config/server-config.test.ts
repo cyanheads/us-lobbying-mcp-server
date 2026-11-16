@@ -5,6 +5,7 @@ beforeEach(() => {
   vi.resetModules();
   vi.stubEnv('USLOBBYING_LDA_API_KEY', undefined);
   vi.stubEnv('USLOBBYING_DATAFRAME_DROP_ENABLED', undefined);
+  vi.stubEnv('USLOBBYING_CLAMP_LIMITS', undefined);
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -13,8 +14,21 @@ async function load() {
 }
 
 describe('server environment configuration', () => {
-  it('defaults to anonymous access and disabled drop', async () => {
-    expect(await load()).toEqual({ dataframeDropEnabled: false });
+  it('defaults to anonymous access, disabled drop and clamped counts', async () => {
+    expect(await load()).toEqual({ dataframeDropEnabled: false, clampLimits: true });
+  });
+  it.each([
+    ['false', false],
+    ['0', false],
+    ['true', true],
+    ['', true],
+  ] as const)('parses USLOBBYING_CLAMP_LIMITS %j as %s', async (value, expected) => {
+    vi.stubEnv('USLOBBYING_CLAMP_LIMITS', value);
+    expect((await load()).clampLimits).toBe(expected);
+  });
+  it('names the clamp variable when its flag is invalid', async () => {
+    vi.stubEnv('USLOBBYING_CLAMP_LIMITS', 'sometimes');
+    await expect(load()).rejects.toThrow('USLOBBYING_CLAMP_LIMITS');
   });
   it.each([
     ['true', true],

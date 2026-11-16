@@ -6,14 +6,14 @@ import { SOURCE_CACHE_TTL_MS } from '../../src/domain/contracts.js';
 import { listReference } from '../../src/mcp-server/tools/definitions/list-reference.tool.js';
 import { initFaraService } from '../../src/services/fara/fara-service.js';
 import { getLdaService, initLdaService } from '../../src/services/lda/lda-service.js';
-import { principal, snapshotResponse } from '../services/fara/fixtures.js';
+import { principal, settle, snapshotResponse } from '../services/fara/fixtures.js';
 
 let calls: URL[];
 let body: unknown;
 let state: ReturnType<typeof createMockContext>['state'];
 beforeEach(() => {
   vi.useFakeTimers();
-  // Expire module-owned public vocabulary cache between tests without resetting source modules.
+  // Expire the module-owned FARA snapshot cache between tests without resetting source modules.
   vi.setSystemTime(new Date(2030, 0, 1 + 3 * testDay++));
   calls = [];
   state = createMockContext().state;
@@ -55,12 +55,11 @@ async function invoke(input: Record<string, unknown>, tenantId = 'default') {
     expect(
       JSON.parse(text.slice(fence.length + 5, text.indexOf(`\n${fence}`, fence.length + 5))),
     ).toEqual(data);
-    expect(new TextEncoder().encode(JSON.stringify(result)).byteLength + 512).toBeLessThanOrEqual(
-      24_000,
-    );
   }
   return { result, data, text };
 }
+const entriesOf = (data: Record<string, unknown>) =>
+  z.array(z.object({ value: z.string(), description: z.string().optional() })).parse(data.entries);
 describe('reference contracts', () => {
   it('identifies the candidate record field to select on both response surfaces', async () => {
     const result = await invoke({ topic: 'identifiers', filter: 'client_id' });
@@ -76,8 +75,8 @@ describe('reference contracts', () => {
       ]),
     );
   });
-  it('retrieves oversized vocabulary fields losslessly through bounded Unicode record windows', async () => {
-    const name = 'é🌲'.repeat(3000);
+  it('delivers entries far over 24,000 bytes whole in their window', async () => {
+    const name = 'é🌲'.repeat(5000);
     body = [
       { value: 'HUGE', name },
       { value: 'SMALL', name: 'Small entry' },
@@ -87,61 +86,15 @@ describe('reference contracts', () => {
     expect(first.data).toMatchObject({
       total_entries: 2,
       matched_entries: 2,
-      records_deferred: 1,
-      entries: [{ value: 'SMALL', name: 'Small entry', source: 'lda' }],
+      records_returned: 2,
+      entries: [
+        { value: 'HUGE', name, source: 'lda' },
+        { value: 'SMALL', name: 'Small entry', source: 'lda' },
+      ],
       output_complete: true,
-      truncated: true,
+      truncated: false,
     });
-    const handle = z
-      .array(z.object({ record_handle: z.string(), retrieval_tool: z.string() }))
-      .parse(first.data.record_handles)[0]!;
-    expect(handle.retrieval_tool).toBe('uslobbying_list_reference');
-    const root = await invoke({ record_handle: handle.record_handle, record_limit: 26 });
-    expect(root.result.isError, root.text).not.toBe(true);
-    expect(root.data.delivery_limits).toEqual({ record_limit: { requested: 26, effective: 25 } });
-    expect(root.data.record_window).toMatchObject({
-      kind: 'object',
-      entries: expect.arrayContaining([{ key: 'name', path: '/name' }]),
-    });
-    expect(root.data).not.toHaveProperty('entries');
-    let restored = '';
-    let offset = 0;
-    for (let index = 0; index < 250; index++) {
-      const result = await invoke({
-        record_handle: handle.record_handle,
-        record_path: '/name',
-        record_offset: offset,
-        record_limit: 25,
-      });
-      expect(result.result.isError, result.text).not.toBe(true);
-      expect(result.data).toMatchObject({
-        topic: 'issue_codes',
-        total_entries: 2,
-        matched_entries: 2,
-      });
-      const window = z
-        .object({
-          text: z.string(),
-          total: z.number(),
-          complete: z.boolean(),
-          next_offset: z.number().optional(),
-        })
-        .parse(result.data.record_window);
-      expect(window.total).toBe(6000);
-      restored += window.text;
-      if (window.complete) break;
-      offset = z.number().parse(window.next_offset);
-    }
-    expect(restored).toBe(name);
-    const past = await invoke({
-      record_handle: handle.record_handle,
-      record_path: '/name',
-      record_offset: 6000,
-    });
-    expect(past.data.record_window).toMatchObject({ text: '', returned: 0, complete: true });
-    const conflict = await invoke({ record_handle: handle.record_handle, topic: 'issue_codes' });
-    expect(conflict.data).toMatchObject({ error: { data: { reason: 'invalid_filter' } } });
-    expect(conflict.text).toContain('invalid_filter');
+    expect(new TextEncoder().encode(first.text).byteLength).toBeGreaterThan(24_000);
     expect(calls).toHaveLength(1);
   });
   it('rejects foreign tenant and expired vocabulary cursors without reacquiring', async () => {
@@ -162,7 +115,7 @@ describe('reference contracts', () => {
     expect(expired.text).toContain('cursor_invalid');
     expect(calls).toHaveLength(1);
   });
-  it('delivers a large complete vocabulary in lossless bounded cursor windows', async () => {
+  it('delivers a vocabulary past its first 125-entry window losslessly, with replay', async () => {
     const entries = Array.from({ length: 180 }, (_, index) => ({
       value: String(index).padStart(3, '0'),
       name: `Synthetic vocabulary ${index} ${'é🌲'.repeat(90)}`,
@@ -176,6 +129,7 @@ describe('reference contracts', () => {
       output_complete: false,
       truncated: true,
       offset: 0,
+      records_returned: 125,
     });
     expect(first.data.next_cursor).toEqual(expect.any(String));
     const second = await invoke({
@@ -184,30 +138,43 @@ describe('reference contracts', () => {
       filter: 'synthetic',
     });
     expect(second.result.isError, second.text).not.toBe(true);
+    expect(second.data).toMatchObject({
+      total_entries: 180,
+      matched_entries: 180,
+      offset: 125,
+      records_returned: 55,
+      output_complete: true,
+      truncated: false,
+    });
+    expect(second.data).not.toHaveProperty('next_cursor');
     const replay = await invoke({ cursor: first.data.next_cursor });
     expect(replay.data).toEqual(second.data);
-    const changed = await invoke({ cursor: second.data.next_cursor, filter: 'different' });
+    const changed = await invoke({ cursor: first.data.next_cursor, filter: 'different' });
     expect(changed.result.isError).toBe(true);
     expect(changed.data).toMatchObject({ error: { data: { reason: 'cursor_invalid' } } });
     expect(changed.text).toContain('cursor_invalid');
-    const received = [...z.array(z.unknown()).parse(first.data.entries)];
-    let output = second;
-    for (let index = 0; index < 100; index++) {
-      expect(output.result.isError, output.text).not.toBe(true);
-      expect(output.data).toMatchObject({
-        total_entries: 180,
-        matched_entries: 180,
-        offset: received.length,
-        records_deferred: 0,
-      });
-      received.push(...z.array(z.unknown()).parse(output.data.entries));
-      if (output.data.output_complete) break;
-      expect(output.data.truncated).toBe(true);
-      output = await invoke({ cursor: output.data.next_cursor });
-    }
-    expect(output.data).toMatchObject({ output_complete: true, truncated: false });
-    expect(received).toEqual(entries.map((entry) => ({ ...entry, source: 'lda' })));
+    expect([
+      ...z.array(z.unknown()).parse(first.data.entries),
+      ...z.array(z.unknown()).parse(second.data.entries),
+    ]).toEqual(entries.map((entry) => ({ ...entry, source: 'lda' })));
     expect(calls).toHaveLength(1);
+  });
+  it('ends an exact multiple of the 125-entry window without an empty trailing window', async () => {
+    const values = Array.from({ length: 250 }, (_, index) => String(index).padStart(3, '0'));
+    body = values.map((value) => ({ value, name: 'Tiny entry' }));
+    const first = await invoke({ topic: 'issue_codes' });
+    expect(first.data).toMatchObject({ offset: 0, records_returned: 125, output_complete: false });
+    const second = await invoke({ cursor: first.data.next_cursor });
+    expect(second.data).toMatchObject({
+      offset: 125,
+      records_returned: 125,
+      output_complete: true,
+      truncated: false,
+    });
+    expect(second.data).not.toHaveProperty('next_cursor');
+    expect([...entriesOf(first.data), ...entriesOf(second.data)].map((e) => e.value)).toEqual(
+      values,
+    );
   });
   it('shares one 45-second budget across LDA constants retries and the FARA country snapshot', async () => {
     const started = Date.now();
@@ -268,32 +235,36 @@ describe('reference contracts', () => {
       timeout.mockRestore();
     }
   });
-  it.each(['issue_codes', 'filing_types', 'government_entities', 'contribution_types'])(
-    'loads complete %s vocabulary and token-AND filters locally',
-    async (topic) => {
-      if (topic === 'government_entities')
-        body = [
-          { id: 1, name: 'Telecommunications' },
-          { id: 2, name: 'Science Technology' },
-          { id: 3, name: 'Health Issues' },
-        ];
-      const result = await invoke({ topic, filter: ' science TECHNOLOGY ' });
-      expect(result.result.isError, result.text).not.toBe(true);
-      expect(result.data).toMatchObject({
-        total_entries: 3,
-        matched_entries: 1,
-        entries: [
-          {
-            value: topic === 'government_entities' ? '2' : 'SCI',
-            name: 'Science Technology',
-            source: 'lda',
-          },
-        ],
-      });
-      expect(calls).toHaveLength(1);
-      expect(calls[0]?.search).toBe('');
-    },
-  );
+  it.each([
+    ['issue_codes', 'filing/lobbyingactivityissues'],
+    ['filing_types', 'filing/filingtypes'],
+    ['government_entities', 'filing/governmententities'],
+    ['contribution_types', 'contribution/itemtypes'],
+    ['states', 'general/states'],
+  ])('loads complete %s vocabulary and token-AND filters locally', async (topic, path) => {
+    if (topic === 'government_entities')
+      body = [
+        { id: 1, name: 'Telecommunications' },
+        { id: 2, name: 'Science Technology' },
+        { id: 3, name: 'Health Issues' },
+      ];
+    const result = await invoke({ topic, filter: ' science TECHNOLOGY ' });
+    expect(result.result.isError, result.text).not.toBe(true);
+    expect(result.data).toMatchObject({
+      topic,
+      total_entries: 3,
+      matched_entries: 1,
+      entries: [
+        {
+          value: topic === 'government_entities' ? '2' : 'SCI',
+          name: 'Science Technology',
+          source: 'lda',
+        },
+      ],
+    });
+    expect(calls.map((url) => url.pathname)).toEqual([`/api/v1/constants/${path}/`]);
+    expect(calls[0]?.search).toBe('');
+  });
   it.each(['identifiers', 'methodology', 'fara_rules'])(
     'returns authored %s without network acquisition',
     async (topic) => {
@@ -303,6 +274,34 @@ describe('reference contracts', () => {
       expect(calls).toEqual([]);
     },
   );
+  it('explains current identifiers, the period-selection grammar and short-form FARA rules', async () => {
+    const identifiers = await invoke({ topic: 'identifiers' });
+    expect(entriesOf(identifiers.data).map((entry) => entry.value)).not.toContain('record_handle');
+    expect(identifiers.text).not.toContain('record_');
+    const methodology = await invoke({ topic: 'methodology' });
+    const selection = entriesOf(methodology.data).find((entry) => entry.value === 'selection');
+    expect(selection?.description).toContain('MM, MMY, MT, MTY, MA, MAY, M@, M@Y');
+    expect(selection?.description).toContain('YY, YYY, YT, YTY, YA, YAY, Y@, Y@Y');
+    expect(selection?.description).toContain('semiannual through 2007 and quarterly from 2008');
+    expect(selection?.description).toContain('off_cycle_period');
+    expect(selection?.description).toContain('neither quarterly nor semiannual (non_quarterly)');
+    const rules = await invoke({ topic: 'fara_rules' });
+    const byValue = new Map(entriesOf(rules.data).map((entry) => [entry.value, entry.description]));
+    expect(byValue.get('status')).toContain('short form');
+    expect(byValue.get('snapshots')).toContain('short-form snapshots');
+    expect(byValue.get('interpretation')).toContain('no identity across registrations');
+  });
+  it('reports the shared constants fetch time as retrieved_at without refetching', async () => {
+    const warmed = await settle(getLdaService().constants('issue_codes'));
+    expect(calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    const output = await invoke({ topic: 'issue_codes' });
+    expect(output.data.retrieved_at).toBe(warmed.retrieved_at);
+    expect(Date.now() - Date.parse(z.string().parse(output.data.retrieved_at))).toBeGreaterThan(
+      3_600_000 - 1,
+    );
+    expect(calls).toHaveLength(1);
+  });
   it('caches complete arrays across different filters until absolute TTL', async () => {
     const first = await invoke({ topic: 'issue_codes', filter: 'TEC' });
     const second = await invoke({ topic: 'issue_codes', filter: 'health' });
@@ -317,6 +316,28 @@ describe('reference contracts', () => {
     ]);
     expect(calls).toHaveLength(2);
     expect(refreshed.data.retrieved_at).not.toBe(first.data.retrieved_at);
+  });
+  it('leaves the shared cached constants unchanged after combining and filtering countries', async () => {
+    body = [
+      { value: 'CA', name: 'Canada' },
+      { value: 'US', name: 'United States' },
+    ];
+    initFaraService(async () =>
+      snapshotResponse('foreign_principals', principal('001', 'Synthetic', 'Canada')),
+    );
+    const cached = await settle(getLdaService().constants('countries'));
+    const before = structuredClone(cached.entries);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    const all = await invoke({ topic: 'countries' });
+    expect(all.data).toMatchObject({ total_entries: 3, matched_entries: 3 });
+    // The FARA snapshot is an hour newer; the combined vocabulary reports the older LDA fetch.
+    expect(all.data.retrieved_at).toBe(cached.retrieved_at);
+    const filtered = await invoke({ topic: 'countries', filter: 'canada' });
+    expect(filtered.data).toMatchObject({ total_entries: 3, matched_entries: 2 });
+    const after = await settle(getLdaService().constants('countries'));
+    expect(after.entries).toBe(cached.entries);
+    expect(after.entries).toEqual(before);
+    expect(calls).toHaveLength(1);
   });
   it('treats regex punctuation literally and supplies complete empty-result recovery', async () => {
     const output = await invoke({ topic: 'issue_codes', filter: '.*' });
@@ -336,12 +357,42 @@ describe('reference contracts', () => {
     expect(output.result.isError).not.toBe(true);
     expect(output.data).toMatchObject({ total_entries: 0, matched_entries: 0, entries: [] });
   });
+  it('requires a topic on the first call', async () => {
+    const output = await invoke({});
+    expect(output.data).toMatchObject({ error: { data: { reason: 'invalid_filter' } } });
+    expect(output.text).toContain('continuation calls need only cursor');
+    expect(calls).toEqual([]);
+  });
   it('rejects unsupported topics before any request', async () => {
     const output = await invoke({ topic: 'covered_positions' });
     expect(output.result.isError).toBe(true);
     expect(output.data).toMatchObject({ error: { code: -32602 } });
     expect(output.text).toContain('topic');
     expect(calls).toEqual([]);
+  });
+  it.each([
+    { record_handle: 'unknown' },
+    { record_path: '/name' },
+    { record_offset: 1 },
+    { record_limit: 26 },
+    { page_size: 10 },
+  ])('rejects removed and absent count inputs %j as unknown arguments', async (extra) => {
+    const output = await invoke({ topic: 'issue_codes', ...extra });
+    expect(output.result.isError).toBe(true);
+    expect(output.data).toMatchObject({ error: { code: -32602 } });
+    expect(calls).toEqual([]);
+  });
+  it('advertises no count or record-window inputs and no record outputs', () => {
+    expect(Object.keys(listReference.input.shape).sort()).toEqual(['cursor', 'filter', 'topic']);
+    const outputs = Object.keys(listReference.output!.shape);
+    for (const removed of [
+      'record_handles',
+      'records_deferred',
+      'record_window',
+      'retrieval_tool',
+      'delivery_limits',
+    ])
+      expect(outputs).not.toContain(removed);
   });
   it('preserves source-schema failure reason and recovery in both consumption paths', async () => {
     body = [{ value: 'TEC' }];

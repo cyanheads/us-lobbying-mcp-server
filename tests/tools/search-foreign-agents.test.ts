@@ -1,28 +1,36 @@
-/** @fileoverview FARA invocation schema, pinned continuation and complete deferred retrieval contracts. @module tests/tools/search-foreign-agents */
+/** @fileoverview FARA invocation schema, count-bounded pinned windows and short-form search contracts. @module tests/tools/search-foreign-agents */
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { JsonValue } from '../../src/domain/json.js';
 import {
   latin1,
   principal,
   registrant,
   settle,
+  shortForm,
   snapshotResponse,
 } from '../services/fara/fixtures.js';
 
+const NAME = 'uslobbying_search_foreign_agents';
+const CLAMP_LOG = 'Clamped a count control to its served ceiling.';
 let fara: typeof import('../../src/services/fara/fara-service.js');
 let definition: typeof import('../../src/mcp-server/tools/definitions/search-foreign-agents.tool.js');
-beforeEach(async () => {
+/** Fresh module graph, so server config and module-owned snapshot caches start empty. */
+async function load() {
   vi.resetModules();
-  vi.useFakeTimers();
-  vi.setSystemTime(new Date('2026-10-25T00:00:00Z'));
   fara = await import('../../src/services/fara/fara-service.js');
   definition = await import('../../src/mcp-server/tools/definitions/search-foreign-agents.tool.js');
+}
+beforeEach(async () => {
+  vi.stubEnv('USLOBBYING_CLAMP_LIMITS', undefined);
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-25T00:00:00Z'));
+  await load();
 });
 afterEach(() => {
   fara.disposeFaraPacer();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 function install(respond: (url: URL) => Response) {
   const calls: string[] = [];
@@ -35,6 +43,15 @@ function install(respond: (url: URL) => Response) {
   fara.initFaraService(fetcher);
   return calls;
 }
+/** Registrant rows numbered from `start + 1`, each named `${name} ${id}`. */
+function registrants(count: number, name: string, start = 0): string {
+  return Array.from({ length: count }, (_, index) =>
+    registrant(String(start + index + 1), `${name} ${start + index + 1}`),
+  ).join('');
+}
+function ids(from: number, to: number): string[] {
+  return Array.from({ length: to - from + 1 }, (_, index) => String(from + index));
+}
 function context() {
   return createMockContext({ errors: definition.searchForeignAgentsTool.errors });
 }
@@ -44,9 +61,12 @@ async function invoke(input: Input, ctx?: ReturnType<typeof context>) {
   const response = ctx
     ? await settle(
         (async () => {
-          const output = await definition.searchForeignAgentsTool.handler(
-            definition.searchForeignAgentsTool.input.parse(input),
-            ctx,
+          // The framework parses the handler's return against `output` before format() sees it.
+          const output = definition.searchForeignAgentsTool.output.parse(
+            await definition.searchForeignAgentsTool.handler(
+              definition.searchForeignAgentsTool.input.parse(input),
+              ctx,
+            ),
           );
           return {
             structuredContent: output,
@@ -66,7 +86,6 @@ async function invoke(input: Input, ctx?: ReturnType<typeof context>) {
       block.text.slice(fence.length + 5, block.text.indexOf(`\n${fence}`, fence.length + 5)),
     ),
   ).toEqual(output);
-  expect(Buffer.byteLength(JSON.stringify(response), 'utf8') + 512).toBeLessThanOrEqual(24_000);
   return { output, text: block.text };
 }
 async function failure(
@@ -85,31 +104,264 @@ async function failure(
   return text;
 }
 
-describe('FARA tool invocation', () => {
-  it('clamps FARA windows before normalized cursor comparison and record selectors', async () => {
-    install(() =>
-      snapshotResponse(
-        'registrants',
-        Array.from({ length: 30 }, (_, n) => registrant(String(n + 1), 'Synthetic')).join(''),
-      ),
-    );
+describe('FARA delivery counts', () => {
+  it('delivers 25 records by default and clamps an over-cap page_size to 1,000, disclosed and logged once', async () => {
+    install(() => snapshotResponse('registrants', registrants(1030, 'Synthetic')));
     const ctx = context();
-    const first = await invoke({ page_size: 26, record_limit: 26 }, ctx);
-    expect(first.output.delivery_limits).toEqual({
-      page_size: { requested: 26, effective: 25 },
-      record_limit: { requested: 26, effective: 25 },
+    const info = vi.spyOn(ctx.log, 'info');
+    const clamps = () => info.mock.calls.filter(([message]) => message === CLAMP_LOG);
+    const defaults = await invoke({}, ctx);
+    expect(defaults.output).toMatchObject({
+      records_returned: 25,
+      delivery_limits: {},
+      effective_filters: { page_size: 25 },
+      output_complete: false,
     });
-    expect(first.output.effective_filters.page_size).toBe(25);
-    const second = await invoke({ cursor: first.output.next_cursor!, page_size: 99 }, ctx);
-    expect((first.output.records?.length ?? 0) + (second.output.records?.length ?? 0)).toBe(30);
-    expect(second.output.delivery_limits).toEqual({ page_size: { requested: 99, effective: 25 } });
-    expect(
-      (await invoke({ cursor: first.output.next_cursor!, page_size: 100 }, ctx)).output,
-    ).toEqual(second.output);
+    const first = await invoke({ page_size: 1e20 }, ctx);
+    expect(first.output.delivery_limits).toEqual({
+      page_size: { requested: 1e20, effective: 1000 },
+    });
+    expect(first.output.records.map((row) => row.registration_number)).toEqual(ids(1, 1000));
+    expect(first.output.effective_filters.page_size).toBe(1000);
+    expect(clamps()).toEqual([
+      [CLAMP_LOG, { tool: NAME, control: 'page_size', requested: 1e20, effective: 1000 }],
+    ]);
+    const rest = await invoke({ cursor: first.output.next_cursor!, page_size: 5000 }, ctx);
+    expect(rest.output).toMatchObject({
+      offset: 1000,
+      records_returned: 30,
+      output_complete: true,
+      delivery_limits: { page_size: { requested: 5000, effective: 1000 } },
+    });
+    expect(rest.output).not.toHaveProperty('next_cursor');
+    expect(clamps()).toHaveLength(1);
     await expect(
-      invoke({ cursor: first.output.next_cursor!, page_size: 24 }, ctx),
+      invoke({ cursor: first.output.next_cursor!, page_size: 999 }, ctx),
     ).rejects.toMatchObject({ data: { reason: 'cursor_invalid' } });
   });
+  it('rejects an over-cap page_size before any download when clamping is disabled', async () => {
+    fara.disposeFaraPacer();
+    vi.stubEnv('USLOBBYING_CLAMP_LIMITS', 'false');
+    await load();
+    const calls = install(() => snapshotResponse('registrants', registrants(2, 'Synthetic')));
+    const response = await settle(
+      runToolContract(definition.searchForeignAgentsTool, { page_size: 1001 }),
+    );
+    expect(response.structuredContent).toMatchObject({
+      error: { data: { reason: 'invalid_filter', field: 'page_size', maximum: 1000 } },
+    });
+    const text = response.content
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(text).toContain('page_size cannot exceed 1000.');
+    expect(calls).toEqual([]);
+    expect((await invoke({ page_size: 1000 })).output.delivery_limits).toEqual({});
+  });
+  it('reads float noise in page_size as the integer it denotes', async () => {
+    install(() => snapshotResponse('registrants', registrants(30, 'Synthetic')));
+    const ctx = context();
+    const first = await invoke({ page_size: 20.000000000000004 }, ctx);
+    expect(first.output).toMatchObject({
+      records_returned: 20,
+      effective_filters: { page_size: 20 },
+    });
+    const rest = await invoke({ cursor: first.output.next_cursor!, page_size: 20 }, ctx);
+    expect(rest.output).toMatchObject({ offset: 20, records_returned: 10, output_complete: true });
+  });
+  it('re-slices pinned windows across 125-row storage chunks and ends exact multiples without an empty window', async () => {
+    const calls = install(() =>
+      snapshotResponse('registrants', registrants(260, 'Alpha') + registrants(40, 'Beta', 260)),
+    );
+    const ctx = context();
+    async function walk(input: Input) {
+      let page = await invoke(input, ctx);
+      const windows = [[page.output.offset, page.output.records_returned]];
+      const delivered = [...page.output.records];
+      let last: string | undefined;
+      while (page.output.next_cursor) {
+        last = page.output.next_cursor;
+        page = await invoke({ cursor: last }, ctx);
+        windows.push([page.output.offset, page.output.records_returned]);
+        delivered.push(...page.output.records);
+      }
+      return { windows, delivered, final: page.output, last };
+    }
+    // 300 matches at 130: windows cross the storage chunks at 125 and 250; the tail continuation ends it.
+    const all = await walk({ page_size: 130 });
+    expect(all.windows).toEqual([
+      [0, 130],
+      [130, 130],
+      [260, 40],
+    ]);
+    expect(all.delivered.map((row) => row.registration_number)).toEqual(ids(1, 300));
+    expect(all.final).toMatchObject({
+      total_matches: 300,
+      output_complete: true,
+      truncated: false,
+    });
+    expect((await invoke({ cursor: all.last }, ctx)).output).toEqual(all.final);
+    // 260 matches at 130 end on their second full window with no trailing cursor.
+    const alpha = await walk({ name_contains: 'alpha', page_size: 130 });
+    expect(alpha.windows).toEqual([
+      [0, 130],
+      [130, 130],
+    ]);
+    expect(alpha.delivered.map((row) => row.registration_number)).toEqual(ids(1, 260));
+    expect(alpha.final).toMatchObject({ total_matches: 260, output_complete: true });
+    expect(alpha.final).not.toHaveProperty('next_cursor');
+    expect(calls).toHaveLength(1);
+  });
+  it('delivers records far over 24,000 bytes whole within page_size', async () => {
+    const rows = [1, 2, 3].map((id) => ({
+      REGISTRATION_NUMBER: '0001',
+      DOCUMENT_TYPE: `Synthetic ${id}`,
+      URL: `https://efile.fara.gov/docs/source-${id}.pdf`,
+      ...(id === 1 && { extra: { text: 'Café '.repeat(8000), values: [null, false, 0] } }),
+    }));
+    install(() => new Response(latin1(JSON.stringify({ ROWSET: { ROW: rows } }))));
+    const ctx = context();
+    const first = await invoke(
+      { mode: 'detail', detail: 'documents', registration_number: '0001', page_size: 2 },
+      ctx,
+    );
+    expect(first.output.records.map((row) => row.raw)).toEqual(rows.slice(0, 2));
+    expect(first.output.records_returned).toBe(2);
+    expect(Buffer.byteLength(first.text, 'utf8')).toBeGreaterThan(48_000);
+    const rest = await invoke({ cursor: first.output.next_cursor }, ctx);
+    expect(rest.output.records.map((row) => row.raw)).toEqual(rows.slice(2));
+  });
+  it('advertises no record-window inputs or outputs', () => {
+    expect(Object.keys(definition.searchForeignAgentsTool.input.shape).sort()).toEqual([
+      'country',
+      'cursor',
+      'detail',
+      'entity',
+      'mode',
+      'name_contains',
+      'page_size',
+      'registration_number',
+      'status',
+    ]);
+    const outputs = Object.keys(definition.searchForeignAgentsTool.output.shape);
+    for (const removed of ['record_handles', 'records_deferred', 'record_window', 'retrieval_tool'])
+      expect(outputs).not.toContain(removed);
+  });
+});
+
+describe('FARA short-form search', () => {
+  it('finds short-form registrants by name with independent registrant status, downloading their snapshot only for them', async () => {
+    const calls = install((url) =>
+      url.pathname.includes('ShortForms')
+        ? snapshotResponse(
+            'short_forms',
+            shortForm('7108', { first: 'Anthony T', last: 'Podesta', date: '05/01/2016' }) +
+              shortForm('6103', {
+                first: 'Heather M.',
+                last: 'Podesta',
+                date: '01/02/2013',
+                termination: '12/31/2019',
+              }) +
+              shortForm('4894', { last: 'Podesta' }) +
+              shortForm('5000', { first: 'Someone', last: 'Else' }),
+          )
+        : snapshotResponse(
+            'registrants',
+            registrant('7108', 'Firm A', '01/01/2020') + registrant('6103', 'Firm B'),
+          ),
+    );
+    await invoke({ name_contains: 'firm' });
+    expect(calls).toEqual(['/bulk/zip/FARA_All_Registrants.xml.zip']);
+    const all = await invoke({ entity: ' SHORT_FORMS ', name_contains: 'podesta', status: 'all' });
+    expect(all.output).toMatchObject({
+      mode: 'search',
+      entity: 'short_forms',
+      status: 'all',
+      total_matches: 3,
+      effective_filters: { entity: 'short_forms', name_contains: 'podesta', status: 'all' },
+    });
+    expect(all.output.records[0]).toMatchObject({
+      registration_number: '7108',
+      entity: 'short_forms',
+      name: 'Anthony T Podesta',
+      first_name: 'Anthony T',
+      last_name: 'Podesta',
+      status: 'active',
+      registration_date: '2016-05-01',
+      registrant_status: 'terminated',
+    });
+    expect(all.output.records[1]).toMatchObject({
+      registration_number: '6103',
+      status: 'terminated',
+      termination_date: '2019-12-31',
+      termination_date_raw: '12/31/2019',
+      registrant_status: 'active',
+    });
+    expect(all.output.records[2]).toMatchObject({ registration_number: '4894', name: 'Podesta' });
+    expect(all.output.records[2]).not.toHaveProperty('first_name');
+    expect(all.output.records[2]).not.toHaveProperty('registrant_status');
+    expect(all.output.notices).toEqual(
+      expect.arrayContaining([expect.stringContaining('establish no identity')]),
+    );
+    expect(all.text).toContain('establish no identity across registrations or with LDA lobbyists');
+    const active = await invoke({ entity: 'short_forms', name_contains: 'podesta' });
+    expect(active.output.records.map((row) => row.registration_number)).toEqual(['7108', '4894']);
+    expect(calls).toEqual([
+      '/bulk/zip/FARA_All_Registrants.xml.zip',
+      '/bulk/zip/FARA_All_ShortForms.xml.zip',
+    ]);
+  });
+  it.each([
+    [
+      'foreign_principals',
+      'ForeignPrincipals',
+      'TERMINATION_DATE',
+      { REG_NUMBER: 7108, FP_NAME: 'Synthetic principal', COUNTRY_NAME: 'Canada' },
+    ],
+    [
+      'short_forms',
+      'ShortFormRegistrants',
+      'SF_TERM_DATE',
+      { REG_NUMBER: 7108, SF_FIRST_NAME: 'Anthony T', SF_LAST_NAME: 'Podesta' },
+    ],
+  ] as const)(
+    'carries detail %s termination dates from the terminated arm on both surfaces',
+    async (detail, noun, field, row) => {
+      const calls = install((url) =>
+        Response.json({
+          ROWSET: {
+            ROW: url.pathname.includes('/Terminated/')
+              ? { ...row, [field]: '2022-05-11T00:00:00' }
+              : row,
+          },
+        }),
+      );
+      const result = await invoke({
+        mode: 'detail',
+        detail,
+        registration_number: '7108',
+        status: 'all',
+      });
+      expect(result.output.records).toHaveLength(2);
+      expect(result.output.records[0]).toMatchObject({ entity: detail, status: 'active' });
+      expect(result.output.records[0]).not.toHaveProperty('termination_date');
+      expect(result.output.records[1]).toMatchObject({
+        entity: detail,
+        status: 'terminated',
+        termination_date: '2022-05-11',
+        termination_date_raw: '2022-05-11T00:00:00',
+      });
+      expect(result.text).toContain('"termination_date":"2022-05-11"');
+      expect(result.text).toContain('"termination_date_raw":"2022-05-11T00:00:00"');
+      expect(calls).toEqual([
+        `/api/v1/${noun}/json/Active/7108`,
+        `/api/v1/${noun}/json/Terminated/7108`,
+      ]);
+    },
+  );
+});
+
+describe('FARA tool invocation', () => {
   it('delivers every redirected document through pinned windows with equal response surfaces', async () => {
     const target =
       'https://efile.fara.gov/CallAPI/GetJSON?a=f?p=API:REGISTRANTDOCS-F_XML:::::F_XML_REG_NUM,F_XML_CC,F_XML_DOC_TYPE:5931,,';
@@ -141,7 +393,7 @@ describe('FARA tool invocation', () => {
         target,
       ]);
       expect(page.output.total_matches).toBe(145);
-      delivered.push(...(page.output.records ?? []));
+      delivered.push(...page.output.records);
       if (!page.output.next_cursor) break;
       page = await invoke({ cursor: page.output.next_cursor }, ctx);
     }
@@ -205,7 +457,7 @@ describe('FARA tool invocation', () => {
       (await settle(fara.getFaraService().search({}, new AbortController().signal))).records[1]
         ?.name,
     ).toBe('Changed Match 0');
-    const ids = first.output.records?.map((row) => row.registration_number) ?? [];
+    const ids = first.output.records.map((row) => row.registration_number);
     let cursor = first.output.next_cursor;
     let final = first.output;
     while (cursor) {
@@ -217,8 +469,8 @@ describe('FARA tool invocation', () => {
       expect(page.output.snapshot_source_urls).toEqual(first.output.snapshot_source_urls);
       expect(page.output.retrieved_at).toBe(first.output.retrieved_at);
       expect(page.output.effective_filters.page_size).toBe(2);
-      expect(page.output.records?.every((record) => record.name.startsWith('Original'))).toBe(true);
-      ids.push(...(page.output.records?.map((row) => row.registration_number) ?? []));
+      expect(page.output.records.every((record) => record.name.startsWith('Original'))).toBe(true);
+      ids.push(...page.output.records.map((row) => row.registration_number));
       cursor = page.output.next_cursor;
       final = page.output;
     }
@@ -247,13 +499,13 @@ describe('FARA tool invocation', () => {
       ctx,
     );
     expect(first.output.total_matches).toBe(2);
-    expect(first.output.records?.[0]).toMatchObject({
+    expect(first.output.records[0]).toMatchObject({
       registration_number: '2',
       status: 'active',
       registrant_status: 'terminated',
     });
     const next = await invoke({ cursor: first.output.next_cursor }, ctx);
-    expect(next.output.records?.[0]?.registration_number).toBe('3');
+    expect(next.output.records[0]?.registration_number).toBe('3');
     expect(calls).toHaveLength(2);
   });
   it('retains live detail documents and authoritative links on both surfaces', async () => {
@@ -265,7 +517,7 @@ describe('FARA tool invocation', () => {
               ROWSET: {
                 ROW: [1, 2, 3].map((id) => ({
                   REGISTRATION_NUMBER: '0001',
-                  DOCUMENT_TYPE: `Caf\u00e9 \u0080 ${id}`,
+                  DOCUMENT_TYPE: `Café \u0080 ${id}`,
                   URL: `https://efile.fara.gov/docs/source-${id}.pdf`,
                   extra: { nested: [false, null, '```\r\n'] },
                 })),
@@ -280,12 +532,12 @@ describe('FARA tool invocation', () => {
       ctx,
     );
     expect(first.output.status).toBe('all');
-    expect(first.output.records?.[0]).not.toHaveProperty('status');
+    expect(first.output.records[0]).not.toHaveProperty('status');
     expect(first.text).toContain('[Official source');
     expect(first.text).toContain('https://efile.fara.gov/docs/source-1.pdf');
     const second = await invoke({ cursor: first.output.next_cursor }, ctx);
     expect(second.output.effective_filters.page_size).toBe(1);
-    expect(second.output.records?.[0]?.name).toBe('Caf\u00e9 \u0080 2');
+    expect(second.output.records[0]?.name).toBe('Café \u0080 2');
     expect(calls).toEqual(['/api/v1/RegDocs/json/0001']);
   });
   it('reports empty detail and no-match snapshot honestly on both surfaces', async () => {
@@ -309,7 +561,7 @@ describe('FARA tool invocation', () => {
       }),
     );
     const result = await invoke({ mode: 'detail', registration_number: '1', detail: 'documents' });
-    expect(result.output.records?.[0]?.raw.URL).toBe(url);
+    expect(result.output.records[0]?.raw.URL).toBe(url);
     const links = result.text.slice(result.text.lastIndexOf('\n```') + 4);
     expect(links).not.toContain('\n# Injected heading');
     expect(links).not.toContain('\nSource paragraph.');
@@ -320,13 +572,10 @@ describe('FARA tool invocation', () => {
     { registration_number: '1' },
     { detail: 'documents' },
     { country: 'Canada' },
+    { entity: 'short_forms', country: 'Canada' },
     { mode: 'detail', registration_number: '1', entity: 'registrants' },
     { mode: 'detail', registration_number: '1', name_contains: 'x' },
     { mode: 'detail', registration_number: '1', detail: 'documents', status: 'active' },
-    { record_path: '/raw' },
-    { record_offset: 1 },
-    { record_limit: 2 },
-    { record_handle: 'unknown', mode: 'search' },
   ])('rejects conflicting selectors before fetch %j', async (input) => {
     const calls = install(() => {
       throw new Error('Unexpected I/O');
@@ -340,8 +589,13 @@ describe('FARA tool invocation', () => {
     { page_size: 1.5 },
     { page_size: '' },
     { mode: 'invalid' },
+    { entity: 'documents' },
     { registration_number: '../1' },
     { unexpected: true },
+    { record_handle: 'unknown' },
+    { record_path: '/raw' },
+    { record_offset: 1 },
+    { record_limit: 2 },
   ])('rejects schema-invalid invocation %j', async (input) => {
     const calls = install(() => {
       throw new Error('Unexpected I/O');
@@ -364,7 +618,6 @@ describe('FARA tool invocation', () => {
       registration_number: '',
       detail: '',
       cursor: '',
-      record_handle: '',
     });
     expect(blank.output.mode).toBe('search');
     await failure({ entity: 'foreign_principals', country: 'CA' }, 'invalid_filter');
@@ -447,107 +700,5 @@ describe('FARA tool invocation', () => {
         .map((part) => part.text)
         .join('\n'),
     ).toMatch(/cancel/i);
-  });
-});
-
-describe('FARA deferred parent retrieval', () => {
-  it('reconstructs complete nested source records through the same tool after cursor advancement', async () => {
-    const raw = {
-      REGISTRATION_NUMBER: '0001',
-      DOCUMENT_TYPE: 'Synthetic',
-      URL: 'https://efile.fara.gov/docs/source.pdf',
-      unknown: {
-        'a/b~c': Array.from({ length: 28 }, (_, id) => ({
-          id,
-          text: 'Caf\u00e9 '.repeat(300),
-          values: [null, false, 0],
-        })),
-      },
-    };
-    const target =
-      'https://efile.fara.gov/CallAPI/GetJSON?a=f?p=API:REGISTRANTDOCS-F_XML:::::F_XML_REG_NUM,F_XML_CC,F_XML_DOC_TYPE:0001,,';
-    const calls = install((url) =>
-      url.pathname.startsWith('/api/')
-        ? new Response(null, { status: 302, headers: { Location: target } })
-        : new Response(
-            latin1(
-              JSON.stringify({
-                ROWSET: {
-                  ROW: [
-                    raw,
-                    {
-                      REGISTRATION_NUMBER: 2,
-                      DOCUMENT_TYPE: 'Second',
-                      URL: 'https://efile.fara.gov/docs/second.pdf',
-                    },
-                  ],
-                },
-              }),
-            ),
-          ),
-    );
-    const ctx = context();
-    const first = await invoke(
-      { mode: 'detail', detail: 'documents', registration_number: '0001', page_size: 1 },
-      ctx,
-    );
-    expect(first.output.records_deferred).toBe(1);
-    expect(first.output.source_urls).toEqual([
-      'https://efile.fara.gov/api/v1/RegDocs/json/0001',
-      target,
-    ]);
-    expect(first.output.records_returned).toBe(0);
-    const handle = first.output.record_handles?.[0]?.record_handle;
-    expect(handle).toBeTypeOf('string');
-    expect(first.output.record_handles?.[0]?.retrieval_tool).toBe(
-      'uslobbying_search_foreign_agents',
-    );
-    await invoke({ cursor: first.output.next_cursor }, ctx);
-    async function reconstruct(path: string): Promise<JsonValue> {
-      let offset = 0;
-      let string = '';
-      let container: JsonValue[] | Record<string, JsonValue> | undefined;
-      for (;;) {
-        const response = await invoke(
-          { record_handle: handle, record_path: path, record_offset: offset, record_limit: 26 },
-          ctx,
-        );
-        expect(response.output.delivery_limits).toEqual({
-          record_limit: { requested: 26, effective: 25 },
-        });
-        const window = response.output.record_window;
-        if (!window) throw new Error('Missing retained window');
-        if (window.kind === 'scalar') return window.value ?? null;
-        if (window.kind === 'string') {
-          string += window.text;
-          if (window.next_offset === undefined) return string;
-        } else {
-          container ??= window.kind === 'array' ? [] : Object.create(null);
-          if (window.kind === 'array')
-            for (const item of window.items ?? [])
-              (container as JsonValue[])[item.index] = Object.hasOwn(item, 'value')
-                ? (item.value ?? null)
-                : await reconstruct(item.path);
-          else
-            for (const entry of window.entries ?? [])
-              (container as Record<string, JsonValue>)[entry.key] = Object.hasOwn(entry, 'value')
-                ? (entry.value ?? null)
-                : await reconstruct(entry.path);
-          if (window.next_offset === undefined) return container ?? null;
-        }
-        if (window.next_offset === undefined || window.next_offset <= offset)
-          throw new Error('Nonprogressing window');
-        offset = window.next_offset;
-      }
-    }
-    const reconstructed = await reconstruct('');
-    expect(reconstructed).toMatchObject({ registration_number: '0001', entity: 'documents', raw });
-    await expect(
-      invoke(
-        { record_handle: handle, record_path: '/raw/unknown/a~1b~0c', record_offset: 29 },
-        ctx,
-      ),
-    ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
-    expect(calls).toHaveLength(2);
   });
 });

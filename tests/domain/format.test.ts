@@ -1,7 +1,7 @@
-/** @fileoverview Lossless response formatting and wire-budget tests. @module tests/domain/format */
+/** @fileoverview Lossless response formatting tests. @module tests/domain/format */
 import { Buffer } from 'node:buffer';
 import { describe, expect, it } from 'vitest';
-import { formatResult, fullResultBytes } from '../../src/domain/format.js';
+import { formatResult } from '../../src/domain/format.js';
 
 function decode(text: string): unknown {
   const firstLineEnd = text.indexOf('\n');
@@ -108,23 +108,24 @@ describe('formatResult', () => {
       '\n\n[Official source 1](<https://efile.fara.gov/#%20Injected%20headingUntrusted%20instruction.>)',
     );
   });
-});
 
-describe('fullResultBytes', () => {
-  it('counts both complete surfaces, document links and 512 envelope bytes in UTF-8', () => {
+  it('renders a record far over 24,000 bytes whole, with its document link', () => {
     const result = {
-      records: [{ name: '漢字🌲\r\n', document: 'https://efile.fara.gov/docs/a.pdf' }],
-      count: 1,
+      filings: [
+        {
+          filing_uuid: '4d712cd3-e92c-4dc9-9d3f-9b3eb7773a40',
+          lobbying_activities: Array.from({ length: 300 }, (_, index) => ({
+            description: `漢字🌲 activity ${index} ${'x'.repeat(1000)}`,
+          })),
+          filing_document_url: 'https://lda.gov/filings/public/filing/a/print/',
+        },
+      ],
     };
-    const json = JSON.stringify(result);
-    const expectedContent = [
-      {
-        type: 'text',
-        text: `\`\`\`json\n${json}\n\`\`\`\n\n[Official source 1](<https://efile.fara.gov/docs/a.pdf>)`,
-      },
-    ];
-    const wire = JSON.stringify({ content: expectedContent, structuredContent: result });
-    expect(fullResultBytes(result)).toBe(Buffer.byteLength(wire, 'utf8') + 512);
-    expect(Buffer.byteLength(wire, 'utf8')).toBeGreaterThan(wire.length);
+    const text = formatResult(result)[0]?.text ?? '';
+    expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(300_000);
+    expect(decode(text)).toEqual(result);
+    expect(
+      text.endsWith('[Official source 1](<https://lda.gov/filings/public/filing/a/print/>)'),
+    ).toBe(true);
   });
 });
